@@ -30,6 +30,7 @@ struct __align__(16) Vec3f {
     __device__ __forceinline__ Vec3f normalized() const;
     __device__ __forceinline__ void normalize();
     __device__ __forceinline__ Vec3f cross(const Vec3f& o) const;
+    __device__ __forceinline__ Vec3f slerp(const Vec3f& o, float t) const;
 };
 
 
@@ -156,6 +157,15 @@ __device__ __forceinline__ void Vec3f::normalize() {
 
 __device__ __forceinline__ Vec3f Vec3f::cross(const Vec3f& o) const {
     return Vec3f(y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x);
+}
+
+
+__device__ __forceinline__ Vec3f Vec3f::slerp(const Vec3f& o, float t) const {
+    float dot_prod = this->dot(o);
+    dot_prod = fmaxf(fminf(dot_prod, 1.0f), -1.0f); // Clamp to [-1, 1]
+    float theta = acosf(dot_prod) * t;
+    Vec3f relative_vec = (o - (*this) * dot_prod).normalized();
+    return (*this) * cosf(theta) + relative_vec * sinf(theta);
 }
 
 

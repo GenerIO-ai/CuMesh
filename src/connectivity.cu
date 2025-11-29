@@ -1,50 +1,10 @@
 #include "cumesh.h"
+#include "shared.h"
+
 #include <cub/cub.cuh>
 
 
 namespace cumesh {
-
-
-static __global__ void arange_kernel(int* array, int N) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N) return;
-    array[tid] = tid;
-}
-
-
-template<typename T>
-static __global__ void fill_kernel(T* array, int N, T value) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N) return;
-    array[tid] = value;
-}
-
-
-template<typename T>
-static __global__ void scatter_kernel(
-    const int* indices,
-    const T* values,
-    const size_t N,
-    T* output
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N) return;
-    output[indices[tid]] = values[tid];
-}
-
-
-template<typename T>
-static __global__ void index_kernel(
-    const T* values,
-    const int* indices,
-    const size_t N,
-    T* output
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N) return;
-    output[tid] = values[indices[tid]];
-}
-
 
 /**
  * Get count of neighboring faces for each vertex
@@ -163,7 +123,6 @@ void CuMesh::get_edges() {
     this->edges.resize(F * 3);
     expand_edges_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(this->faces.ptr, F, this->edges.ptr);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     // sort edges
     this->temp_storage.resize(F * 3 * sizeof(uint64_t));
@@ -181,7 +140,6 @@ void CuMesh::get_edges() {
         reinterpret_cast<uint64_t*>(this->temp_storage.ptr),
         F * 3
     ));
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     // unique edges
     int* num_edges;
@@ -198,7 +156,6 @@ void CuMesh::get_edges() {
         reinterpret_cast<uint64_t*>(this->temp_storage.ptr), this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
         F * 3
     ));
-    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(&this->edges.size, num_edges, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(num_edges));
 }
@@ -830,152 +787,6 @@ void CuMesh::get_manifold_boundary_adjacency() {
         this->manifold_bound_adj.ptr
     );
     CUDA_CHECK(cudaGetLastError());
-}
-
-
-/**
- * Hook edges
- * @param adj: the buffer for adjacency, shape (M)
- * @param M: the number of adjacency
- * @param conn_comp_ids: the buffer for connected component ids, shape (F)
- * @param end_flag: flag to indicate if any union operation happened
- */
-static __global__ void hook_edges_kernel(
-    const int2* adj,
-    const int M,
-    int* conn_comp_ids,
-    int* end_flag
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= M) return;
-
-    // get adjacent faces
-    int f0 = adj[tid].x;
-    int f1 = adj[tid].y;
-
-    // union
-    // find roots
-    int root0 = conn_comp_ids[f0];
-    while (root0 != conn_comp_ids[root0]) {
-        root0 = conn_comp_ids[root0];
-    }
-    int root1 = conn_comp_ids[f1];
-    while (root1 != conn_comp_ids[root1]) {
-        root1 = conn_comp_ids[root1];
-    }
-
-    if (root0 == root1) return;
-
-    int high = max(root0, root1);
-    int low = min(root0, root1);
-    atomicMin(&conn_comp_ids[high], low);
-    *end_flag = 0;
-}
-
-
-/**
- * Compress connected components
- * @param conn_comp_ids: the buffer for connected component ids, shape (F)
- * @param F: the number of faces
- */
-static __global__ void compress_components_kernel(
-    int* conn_comp_ids,
-    const int F
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= F) return;
-
-    int p = conn_comp_ids[tid];
-    while (p != conn_comp_ids[p]) {
-        int pp = conn_comp_ids[p];
-        conn_comp_ids[tid] = pp;
-        p = conn_comp_ids[tid];
-    }
-}
-
-
-static __global__ void get_diff_kernel(
-    const int* ids_sorted,
-    int* ids_diff,
-    const int N
-) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N) return;
-    if (tid == N-1) {
-        ids_diff[tid] = 1;
-        return;
-    }
-    if (ids_sorted[tid] != ids_sorted[tid+1]) {
-        ids_diff[tid] = 1;
-    } else {
-        ids_diff[tid] = 0;
-    }
-}
-
-
-int compress_ids(int* ids, int N, Buffer<char>& cub_temp_storage) {
-    int *cu_indices, *cu_indices_argsorted, *cu_ids_sorted;
-    CUDA_CHECK(cudaMalloc(&cu_indices, N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_indices_argsorted, N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_ids_sorted, N * sizeof(int)));
-    arange_kernel<<<(N+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(cu_indices, N);
-    CUDA_CHECK(cudaGetLastError());
-    size_t temp_storage_bytes = 0;
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_storage_bytes,
-        ids, cu_ids_sorted,
-        cu_indices, cu_indices_argsorted,
-        N
-    ));
-    cub_temp_storage.resize(temp_storage_bytes);
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        cub_temp_storage.ptr, temp_storage_bytes,
-        ids, cu_ids_sorted,
-        cu_indices, cu_indices_argsorted,
-        N
-    ));
-    CUDA_CHECK(cudaFree(cu_indices));
-
-    // get diff
-    int* cu_new_ids;
-    CUDA_CHECK(cudaMalloc(&cu_new_ids, N * sizeof(int)));
-    get_diff_kernel<<<(N+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
-        cu_ids_sorted,
-        cu_new_ids,
-        N
-    );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaFree(cu_ids_sorted));
-    
-    // scan diff
-    temp_storage_bytes = 0;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, temp_storage_bytes,
-        cu_new_ids,
-        N
-    ));
-    cub_temp_storage.resize(temp_storage_bytes);
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        cub_temp_storage.ptr, temp_storage_bytes,
-        cu_new_ids,
-        N
-    ));
-    
-    // scatter
-    scatter_kernel<<<(N+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
-        cu_indices_argsorted,
-        cu_new_ids,
-        N,
-        ids
-    );
-    CUDA_CHECK(cudaGetLastError());
-    int num_components;
-    CUDA_CHECK(cudaMemcpy(&num_components, cu_new_ids + N-1, sizeof(int), cudaMemcpyDeviceToHost));
-    num_components += 1;
-    CUDA_CHECK(cudaFree(cu_new_ids));
-    CUDA_CHECK(cudaFree(cu_indices_argsorted));
-
-    return num_components;
 }
 
 

@@ -30,11 +30,14 @@ setup(
         CUDAExtension(
             name="cumesh._C",
             sources=[
+                "src/atlas.cu",
                 "src/clean_up.cu",
                 "src/cumesh.cu",
                 "src/connectivity.cu",
+                "src/geometry.cu",
                 "src/io.cu",
                 "src/simplify.cu",
+                "src/shared.cu",
                 
                 # main
                 "src/ext.cpp",

@@ -260,7 +260,7 @@ void get_edge_collapse_cost(
  * @param V: the number of vertices
  * @param F: the number of faces
  * @param E: the number of edges
- * @param face_propagated_costs: the buffer for edge collapse costs propagated, shape (F)
+ * @param propagated_costs: the buffer for edge collapse costs propagated, shape (F)
  */
 static __global__ void propagate_cost_kernel(
     const uint64_t* edges,
@@ -270,7 +270,7 @@ static __global__ void propagate_cost_kernel(
     const int V,
     const int F,
     const int E,
-    uint64_t* face_propagated_costs
+    uint64_t* propagated_costs
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= E) return;
@@ -284,10 +284,10 @@ static __global__ void propagate_cost_kernel(
 
     // propagate cost to neighboring faces
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        atomicMin(reinterpret_cast<unsigned long long*>(&face_propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
     }
     for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        atomicMin(reinterpret_cast<unsigned long long*>(&face_propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
+        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
     }
 }
 
@@ -301,15 +301,15 @@ void propagate_cost(
     size_t V = ctx.vertices.size;
     size_t F = ctx.faces.size;
     size_t E = ctx.edges.size;
-    ctx.face_propagated_costs.resize(F);
-    ctx.face_propagated_costs.fill(std::numeric_limits<uint64_t>::max());
+    ctx.propagated_costs.resize(F);
+    ctx.propagated_costs.fill(std::numeric_limits<uint64_t>::max());
     propagate_cost_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
         ctx.edges.ptr,
         ctx.vert2face.ptr,
         ctx.vert2face_offset.ptr,
         ctx.edge_collapse_costs.ptr,
         V, F, E,
-        ctx.face_propagated_costs.ptr
+        ctx.propagated_costs.ptr
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -324,7 +324,7 @@ void propagate_cost(
  * @param vert2face: the buffer for neighboring face ids, shape (total_neighbor_face_cnt)
  * @param vert2face_offset: the buffer for neighboring face ids offset, shape (V+1)
  * @param edge_collapse_costs: the buffer for edge collapse costs, shape (E)
- * @param face_propagated_costs: the buffer for edge collapse costs propagated, shape (F)
+ * @param propagated_costs: the buffer for edge collapse costs propagated, shape (F)
  * @param vert_is_boundary: the buffer for boundary vertex indicator, shape (V)
  * @param V: the number of vertices
  * @param F: the number of faces
@@ -340,7 +340,7 @@ static __global__ void collapse_edges_kernel(
     const int* vert2face,
     const int* vert2face_offset,
     const float* edge_collapse_costs,
-    const uint64_t* face_propagated_costs,
+    const uint64_t* propagated_costs,
     const uint8_t * vert_is_boundary,
     const int V,
     const int F,
@@ -362,10 +362,10 @@ static __global__ void collapse_edges_kernel(
     uint64_t pack = pack_key_value_positive(tid, cost);
 
     for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
-        if (face_propagated_costs[vert2face[f]] != pack) return;
+        if (propagated_costs[vert2face[f]] != pack) return;
     }
     for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
-        if (face_propagated_costs[vert2face[f]] != pack) return;
+        if (propagated_costs[vert2face[f]] != pack) return;
     }
 
     // collapse edge
@@ -459,7 +459,7 @@ void collapse_edges(
         ctx.vert2face.ptr,
         ctx.vert2face_offset.ptr,
         ctx.edge_collapse_costs.ptr,
-        ctx.face_propagated_costs.ptr,
+        ctx.propagated_costs.ptr,
         ctx.vert_is_boundary.ptr,
         V, F, E,
         collapse_thresh,

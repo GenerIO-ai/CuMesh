@@ -8,6 +8,8 @@ CuMesh::CuMesh() {}
 CuMesh::~CuMesh() {
     vertices.free();
     faces.free();
+    face_normals.free();
+    vertex_normals.free();
     edges.free();
     boundaries.free();
     vert_is_boundary.free();
@@ -32,7 +34,20 @@ CuMesh::~CuMesh() {
     vertices_map.free();
     faces_map.free();
     edge_collapse_costs.free();
-    face_propagated_costs.free();
+    propagated_costs.free();
+
+    atlas_chart_ids.free();
+    atlas_chart_vertex_map.free();
+    atlas_chart_faces.free();
+    atlas_chart_faces_offset.free();
+    atlas_chart_uvs.free();
+
+    atlas_chart_normal_cones.free();
+    atlas_chart_adj.free();
+    atlas_chart2edge.free();
+    atlas_chart2edge_cnt.free();
+    atlas_chart2edge_offset.free();
+
     temp_storage.free();
     cub_temp_storage.free();
 }

@@ -17,6 +17,10 @@ public:
     Buffer<float3> vertices;
     Buffer<int3> faces;
 
+    // Geometric properties
+    Buffer<float3> face_normals;
+    Buffer<float3> vertex_normals;
+
     // Connectivity
     Buffer<uint64_t> edges;
     Buffer<int> boundaries;
@@ -52,7 +56,21 @@ public:
 
     // Simplification
     Buffer<float> edge_collapse_costs;
-    Buffer<uint64_t> face_propagated_costs;
+    Buffer<uint64_t> propagated_costs;
+
+    // Atlasing
+    int atlas_num_charts;
+    Buffer<int> atlas_chart_ids;
+    Buffer<int> atlas_chart_vertex_map;
+    Buffer<int3> atlas_chart_faces;
+    Buffer<int> atlas_chart_faces_offset;
+    Buffer<float2> atlas_chart_uvs;
+
+    Buffer<float4> atlas_chart_normal_cones;
+    Buffer<uint64_t> atlas_chart_adj;
+    Buffer<int> atlas_chart2edge;
+    Buffer<int> atlas_chart2edge_cnt;
+    Buffer<int> atlas_chart2edge_offset;
 
     // Temporary storage
     Buffer<char> temp_storage;
@@ -90,6 +108,20 @@ public:
      * @return A tuple of the vertex positions and the triangle faces.
      */
     std::tuple<torch::Tensor, torch::Tensor> read();
+
+    /**
+     * Get the face normals.
+     * 
+     * @return The face normals as an [F, 3] tensor.
+     */
+    torch::Tensor read_face_normals();
+
+    /**
+     * Get the normals of the vertices.
+     * 
+     * @return The vertex normals as an [V, 3] tensor.
+     */
+    torch::Tensor read_vertex_normals();
     
     /**
      * Get the edges of the mesh.
@@ -148,6 +180,26 @@ public:
      */
     std::tuple<int, torch::Tensor, torch::Tensor> read_boundary_loops();
     
+
+    // Geometric functions
+
+    /**
+     * Compute face normals.
+     * This function refreshes:
+     * - face_normals
+     */
+    void compute_face_normals();
+
+    /**
+     * Compute vertex normals.
+     * This function requires:
+     * - vert2face
+     * - vert2face_offset
+     * This function refreshes:
+     * - vertex_normals
+     */
+    void compute_vertex_normals();
+
 
     // Connectivity functions
 
@@ -298,6 +350,7 @@ public:
      * Remove faces.
      */
     void remove_faces(torch::Tensor& face_mask);
+    void _remove_faces(uint8_t* face_mask);
 
     /**
      * Remove unreferenced vertices.
@@ -320,6 +373,18 @@ public:
     void fill_holes(float max_hole_perimeter);
 
     /**
+     * Repair Non-manifold edges by splitting edges.
+     * This function requires:
+     * - manifold_face_adj
+     * This function refreshes:
+     * - vertices
+     * - faces
+     * This function destroys:
+     * - All connectivity information
+     */
+    void repair_non_manifold_edges();
+
+    /**
      * Remove small connected components.
      * This function requires:
      * - conn_comp_ids
@@ -332,6 +397,15 @@ public:
      * @param min_area The minimum area of the connected components to be kept.
      */
     void remove_small_connected_components(float min_area);
+
+    /**
+     * Unify face orientations.
+     * This function requires:
+     * - manifold_face_adj
+     * This function refreshes:
+     * - faces
+     */
+    void unify_face_orientations();
     
 
     // Simplification functions
@@ -350,6 +424,50 @@ public:
      * @return A tuple of the number of vertices and the number of faces after simplification.
      */
     std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
+
+
+    // Atlasing functions
+
+    /**
+     * Compute charts for atlasing.
+     * This function requires:
+     * - manifold_face_adj
+     * This function refreshes:
+     * - atlas_face_chart_ids
+     * - atlas_chart_vertex_map
+     * - atlas_chart_faces
+     * - atlas_chart_faces_offset
+     *
+     * @param threshold_cone_half_angle_rad The threshold for the cone half angle in radians.
+     * @param refine_iterations The number of refinement iterations.
+     * @param global_iterations The number of global iterations.
+     * @param smooth_strength The strength of the smoothing.
+     */
+    void compute_charts(float threshold_cone_half_angle_rad, int refine_iterations, int global_iterations, float smooth_strength);
+
+    /**
+     * Parameterize each chart.
+     * This function requires:
+     * - atlas_chart_vertex_map
+     * - atlas_chart_faces
+     * - atlas_chart_faces_offset
+     * This function refreshes:
+     * - atlas_chart_uvs
+     */
+    void parameterize_charts();
+
+
+    /**
+     * Read the atlas charts.
+     *
+     * @return A tuple of:
+     * - The number of charts.
+     * - The chart ids as an [F] tensor.
+     * - The chart vertex map as an [N] tensor.
+     * - The chart faces as an [C, 3] tensor.
+     * - The chart faces offset as an [C+1] tensor.
+     */
+    std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> read_atlas_charts();
 };
 
 } // namespace cumesh

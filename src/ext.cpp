@@ -15,6 +15,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("num_boundary_loops", &cumesh::CuMesh::num_boundary_loops)
         .def("init", &cumesh::CuMesh::init)
         .def("read", &cumesh::CuMesh::read)
+        .def("read_face_normals", &cumesh::CuMesh::read_face_normals)
+        .def("read_vertex_normals", &cumesh::CuMesh::read_vertex_normals)
         .def("read_edges", &cumesh::CuMesh::read_edges)
         .def("read_boundaries", &cumesh::CuMesh::read_boundaries)
         .def("read_manifold_face_adjacency", &cumesh::CuMesh::read_manifold_face_adjacency)
@@ -22,6 +24,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("read_connected_components", &cumesh::CuMesh::read_connected_components)
         .def("read_boundary_connected_components", &cumesh::CuMesh::read_boundary_connected_components)
         .def("read_boundary_loops", &cumesh::CuMesh::read_boundary_loops)
+        .def("compute_face_normals", &cumesh::CuMesh::compute_face_normals)
+        .def("compute_vertex_normals", &cumesh::CuMesh::compute_vertex_normals)
         .def("get_vertex_face_adjacency", &cumesh::CuMesh::get_vertex_face_adjacency)
         .def("get_edges", &cumesh::CuMesh::get_edges)
         .def("get_edge_face_adjacency", &cumesh::CuMesh::get_edge_face_adjacency)
@@ -39,5 +43,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_unreferenced_vertices", &cumesh::CuMesh::remove_unreferenced_vertices)
         .def("remove_duplicate_faces", &cumesh::CuMesh::remove_duplicate_faces)
         .def("fill_holes", &cumesh::CuMesh::fill_holes)
-        .def("simplify_step", &cumesh::CuMesh::simplify_step);
+        .def("repair_non_manifold_edges", &cumesh::CuMesh::repair_non_manifold_edges)
+        .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
+        .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
+        .def("simplify_step", &cumesh::CuMesh::simplify_step)
+        .def("compute_charts", &cumesh::CuMesh::compute_charts)
+        .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
 }

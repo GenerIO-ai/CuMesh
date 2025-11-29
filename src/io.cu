@@ -72,6 +72,30 @@ std::tuple<torch::Tensor, torch::Tensor> CuMesh::read() {
 }
 
 
+torch::Tensor CuMesh::read_face_normals() {
+    auto face_normals = torch::empty({ static_cast<int64_t>(this->faces.size), 3 }, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    copy_pack4x3_to_array<<<(this->faces.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        reinterpret_cast<const int3*>(this->face_normals.ptr),
+        this->faces.size,
+        reinterpret_cast<int*>(face_normals.data_ptr<float>())
+    );
+    CUDA_CHECK(cudaGetLastError());
+    return face_normals;
+}
+
+
+torch::Tensor CuMesh::read_vertex_normals() {
+    auto vertex_normals = torch::empty({ static_cast<int64_t>(this->vertex_normals.size), 3 }, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    copy_pack4x3_to_array<<<(this->vertex_normals.size+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(
+        reinterpret_cast<const int3*>(this->vertex_normals.ptr),
+        this->vertex_normals.size,
+        reinterpret_cast<int*>(vertex_normals.data_ptr<float>())
+    );
+    CUDA_CHECK(cudaGetLastError());
+    return vertex_normals;
+}
+
+
 torch::Tensor CuMesh::read_edges() {
     auto edges = torch::empty({ static_cast<int64_t>(this->edges.size), 2 }, torch::dtype(torch::kInt32).device(torch::kCUDA));
     CUDA_CHECK(cudaMemcpy(

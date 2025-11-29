@@ -59,6 +59,24 @@ class CuMesh:
         """
         return self.cu_mesh.read()
     
+    def read_face_normals(self) -> torch.Tensor:
+        """
+        Read the normals of the faces from the CuMesh.
+
+        Returns:
+            The face normals as an [F, 3] tensor.
+        """
+        return self.cu_mesh.read_face_normals()
+    
+    def read_vertex_normals(self) -> torch.Tensor:
+        """
+        Read the normals of the vertices from the CuMesh.
+
+        Returns:
+            The vertex normals as an [V, 3] tensor.
+        """
+        return self.cu_mesh.read_vertex_normals()
+    
     def read_edges(self) -> torch.Tensor:
         """
         Read the edges of the mesh from the CuMesh.
@@ -129,6 +147,18 @@ class CuMesh:
                 - a tensor of shape [N_loops + 1] containing the offsets of the boundary edges in each loop.
         """
         return self.cu_mesh.read_boundary_loops()
+    
+    def compute_face_normals(self):
+        """
+        Compute the normals of the faces.
+        """
+        self.cu_mesh.compute_face_normals()
+    
+    def compute_vertex_normals(self):
+        """
+        Compute the normals of the vertices.
+        """
+        self.cu_mesh.compute_vertex_normals()
         
     def get_vertex_face_adjacency(self):
         """
@@ -220,6 +250,15 @@ class CuMesh:
         """
         self.cu_mesh.remove_duplicate_faces()
         
+    def remove_degenerate_faces(self):
+        """
+        Remove degenerate faces from the mesh.
+        """
+        self.cu_mesh.compute_face_normals()
+        face_normals = self.cu_mesh.read_face_normals()
+        kept = (face_normals.isnan().sum(dim=1) == 0)
+        self.remove_faces(kept)
+        
     def fill_holes(self, max_hole_perimeter: float=3e-2):
         """
         Fill holes in the mesh.
@@ -228,6 +267,27 @@ class CuMesh:
             max_hole_perimeter: the maximum perimeter of a hole to fill.
         """
         self.cu_mesh.fill_holes(max_hole_perimeter)
+        
+    def repair_non_manifold_edges(self):
+        """
+        Repair Non-manifold edges by splitting edges
+        """
+        self.cu_mesh.repair_non_manifold_edges()
+        
+    def remove_small_connected_components(self, min_area: float):
+        """
+        Repair Non-manifold edges by splitting edges
+        
+        Args:
+            min_area: the minimum area of a connected component to keep.
+        """
+        self.cu_mesh.remove_small_connected_components(min_area)
+        
+    def unify_face_orientations(self):
+        """
+        Unify the orientations of the faces.
+        """
+        self.cu_mesh.unify_face_orientations()
     
     def simplify(self, target_num_faces: int, verbose: bool=False, options: dict={}):
         """
@@ -243,23 +303,54 @@ class CuMesh:
         num_face = self.cu_mesh.num_faces()
         if num_face <= target_num_faces:
             return
+        
+        if verbose:
+            pbar = tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose)
 
-        with tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose) as pbar:
-            thresh = options.get('thresh', 1e-8)
-            lambda_edge_length = options.get('lambda_edge_length', 1e-2)
-            lambda_skinny = options.get('lambda_skinny', 1e-3)
-            while True:
+        thresh = options.get('thresh', 1e-8)
+        lambda_edge_length = options.get('lambda_edge_length', 1e-2)
+        lambda_skinny = options.get('lambda_skinny', 1e-3)
+        while True:
+            if verbose:
                 pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
-                
-                new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
-                
+            
+            new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
+            
+            if verbose:
                 pbar.update(num_face - max(target_num_faces, new_num_face))
 
-                if new_num_face <= target_num_faces:
-                    break
-                
-                del_num_face = num_face - new_num_face
-                if del_num_face / num_face < 1e-2:
-                    thresh *= 10
-                num_face = new_num_face
+            if new_num_face <= target_num_faces:
+                break
+            
+            del_num_face = num_face - new_num_face
+            if del_num_face / num_face < 1e-2:
+                thresh *= 10
+            num_face = new_num_face
+            
+        if verbose:
+            pbar.close()
+            
+    def compute_charts(self, threshold_cone_half_angle_rad: float, refine_iterations: int=100, global_iterations: int=1, smooth_strength: float=2):
+        """
+        Compute the atlas charts.
+
+        Args:
+            threshold_cone_half_angle_rad: The threshold for the cone half angle in radians.
+            refine_iterations: The number of refinement iterations.
+        """
+        self.cu_mesh.compute_charts(threshold_cone_half_angle_rad, refine_iterations, global_iterations, smooth_strength)
+        
+    def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Read the atlas chart IDs for each face.
+        
+        Returns:
+            A tuple of two values:
+                - the number of charts
+                - a tensor of shape [F] containing the chart ID for each face.
+                - a tensor of shape [N] containing the vertex map
+                - a tensor of shape [C, 3] containing the chart faces
+                - a tensor of shape [C+1] containing the offsets of the chart faces in the faces tensor.
+        """
+        return self.cu_mesh.read_atlas_charts()
             
