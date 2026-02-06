@@ -1,0 +1,70 @@
+name: Build & Release Wheels (CUDA)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-wheels:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build wheel inside CUDA container
+        env:
+          CUMESH_COMMIT: c4ad6125924fcedfd13f0bd61520ca2d24eb7a87
+          CUBVH_COMMIT: ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          docker run --rm \
+            -v "${PWD}:/src" -w /src \
+            -e TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX" \
+            -e CUDA_HOME=/usr/local/cuda \
+            -e CUMESH_COMMIT="${CUMESH_COMMIT}" \
+            -e CUBVH_COMMIT="${CUBVH_COMMIT}" \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+            bash -lc '
+              set -euo pipefail
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                python3 python3-pip python3-dev \
+                git build-essential ninja-build cmake
+
+              python3 -m pip install -U pip setuptools wheel build
+
+              # Match your runtime torch (cu124)
+              python3 -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+              # Ensure we build exactly the desired commits
+              git fetch --all --tags
+              git checkout "$CUMESH_COMMIT"
+
+              git submodule update --init --recursive
+
+              # Pin cubvh submodule commit
+              cd third_party/cubvh
+              git fetch --all --tags
+              git checkout "$CUBVH_COMMIT"
+              cd /src
+
+              # Build wheel
+              python3 -m pip wheel . -w dist --no-build-isolation -v
+
+              ls -lah dist
+            '
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Adjust if your wheel name differs (check dist/ output)
+          files: dist/*.whl
+          generate_release_notes: true
