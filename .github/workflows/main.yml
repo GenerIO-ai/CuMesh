@@ -34,6 +34,8 @@ jobs:
             bash -lc '
               set -euo pipefail
 
+              git config --global --add safe.directory /src
+
               apt-get update
               apt-get install -y --no-install-recommends \
                 python3 python3-pip python3-dev \
