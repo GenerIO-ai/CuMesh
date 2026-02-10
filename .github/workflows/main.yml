@@ -61,7 +61,7 @@ jobs:
               cd /src
 
               # Build wheel
-              python3 -m pip wheel . -w dist --no-build-isolation -v
+              python3 -m pip wheel . -w dist --no-build-isolation --no-deps -v
 
               ls -lah dist
             '
@@ -70,5 +70,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # Adjust if your wheel name differs (check dist/ output)
-          files: dist/*.whl
+          files: dist/cumesh*.whl
           generate_release_notes: true
