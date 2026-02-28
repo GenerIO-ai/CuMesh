@@ -32,60 +32,63 @@ jobs:
             -e CUDA_HOME=/usr/local/cuda \
             -e CUMESH_COMMIT="${CUMESH_COMMIT}" \
             -e CUBVH_COMMIT="${CUBVH_COMMIT}" \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e TZ=Etc/UTC \
             nvidia/cuda:12.4.1-devel-ubuntu22.04 \
-            bash -lc '
-              set -euo pipefail
+              bash -lc '
+                set -euo pipefail
 
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                software-properties-common \
-                git build-essential ninja-build cmake
+                export DEBIAN_FRONTEND=noninteractive
+                export TZ=Etc/UTC
 
-              # Install Python 3.10 (Ubuntu 22.04 default) + Python 3.11 (deadsnakes)
-              add-apt-repository -y ppa:deadsnakes/ppa
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                python3.10 python3.10-dev python3.10-venv \
-                python3.11 python3.11-dev python3.11-venv
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  ca-certificates curl \
+                  software-properties-common \
+                  git build-essential ninja-build cmake
 
-              git config --global --add safe.directory "*"
+                # Install Python 3.10 (default) + Python 3.11
+                add-apt-repository -y ppa:deadsnakes/ppa
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  python3.10 python3.10-dev python3.10-venv \
+                  python3.11 python3.11-dev python3.11-venv
 
-              # Ensure we build exactly the desired commits
-              git fetch --all --tags
-              git checkout "$CUMESH_COMMIT"
+                git config --global --add safe.directory "*"
 
-              git submodule update --init --recursive
+                # Ensure correct commits
+                git fetch --all --tags
+                git checkout "$CUMESH_COMMIT"
+                git submodule update --init --recursive
 
-              # Pin cubvh submodule commit
-              cd third_party/cubvh
-              git fetch --all --tags
-              git checkout "$CUBVH_COMMIT"
-              cd /src
+                cd third_party/cubvh
+                git fetch --all --tags
+                git checkout "$CUBVH_COMMIT"
+                cd /src
 
-              build_one () {
-                PYBIN="$1"
+                build_one () {
+                  PYBIN="$1"
 
-                # Clean between builds in case build artifacts are reused
-                rm -rf build/ .eggs/ *.egg-info || true
+                  rm -rf build/ .eggs/ *.egg-info || true
 
-                "$PYBIN" -m pip install -U pip setuptools wheel build
+                  "$PYBIN" -m ensurepip --upgrade || true
+                  "$PYBIN" -m pip install -U pip setuptools wheel build
 
-                # Match your runtime torch (cu124)
-                "$PYBIN" -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+                  # Match your runtime torch (cu124)
+                  "$PYBIN" -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-                # Build wheel for this interpreter
-                "$PYBIN" -m pip wheel . -w dist --no-build-isolation --no-deps -v
-              }
+                  # Build wheel
+                  "$PYBIN" -m pip wheel . -w dist --no-build-isolation --no-deps -v
+                }
 
-              build_one python3.10
-              build_one python3.11
+                build_one python3.10
+                build_one python3.11
 
-              ls -lah dist
-            '
+                ls -lah dist
+              '
 
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Upload both cp310 and cp311 wheels
           files: dist/cumesh*.whl
           generate_release_notes: true
