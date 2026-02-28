@@ -50,9 +50,12 @@ jobs:
                 # Install Python 3.10 (default) + Python 3.11
                 add-apt-repository -y ppa:deadsnakes/ppa
                 apt-get update
+
+                # Key change: install distutils + pip packages from apt (no ensurepip)
                 apt-get install -y --no-install-recommends \
-                  python3.10 python3.10-dev python3.10-venv \
-                  python3.11 python3.11-dev python3.11-venv
+                  python3.10 python3.10-dev python3.10-venv python3.10-distutils \
+                  python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+                  python3-pip
 
                 git config --global --add safe.directory "*"
 
@@ -68,17 +71,25 @@ jobs:
 
                 build_one () {
                   PYBIN="$1"
+                  VENV_DIR=".venv-${PYBIN}"
 
                   rm -rf build/ .eggs/ *.egg-info || true
+                  rm -rf "$VENV_DIR" || true
 
-                  "$PYBIN" -m ensurepip --upgrade || true
-                  "$PYBIN" -m pip install -U pip setuptools wheel build
+                  # Create an isolated venv; pip will be present (backed by apt pip)
+                  "$PYBIN" -m venv "$VENV_DIR"
+                  . "$VENV_DIR/bin/activate"
+
+                  python -m pip --version
+                  python -m pip install -U pip setuptools wheel build
 
                   # Match your runtime torch (cu124)
-                  "$PYBIN" -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+                  python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
                   # Build wheel
-                  "$PYBIN" -m pip wheel . -w dist --no-build-isolation --no-deps -v
+                  python -m pip wheel . -w /src/dist --no-build-isolation --no-deps -v
+
+                  deactivate
                 }
 
                 build_one python3.10
