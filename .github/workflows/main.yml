@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build wheel inside CUDA container
+      - name: Build wheels (cp310 + cp311) inside CUDA container
         env:
           CUMESH_COMMIT: c4ad6125924fcedfd13f0bd61520ca2d24eb7a87
           CUBVH_COMMIT: ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
@@ -38,15 +38,17 @@ jobs:
 
               apt-get update
               apt-get install -y --no-install-recommends \
-                python3 python3-pip python3-dev \
+                software-properties-common \
                 git build-essential ninja-build cmake
 
-              git config --global --add safe.directory "*"
-              
-              python3 -m pip install -U pip setuptools wheel build
+              # Install Python 3.10 (Ubuntu 22.04 default) + Python 3.11 (deadsnakes)
+              add-apt-repository -y ppa:deadsnakes/ppa
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                python3.10 python3.10-dev python3.10-venv \
+                python3.11 python3.11-dev python3.11-venv
 
-              # Match your runtime torch (cu124)
-              python3 -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+              git config --global --add safe.directory "*"
 
               # Ensure we build exactly the desired commits
               git fetch --all --tags
@@ -60,8 +62,23 @@ jobs:
               git checkout "$CUBVH_COMMIT"
               cd /src
 
-              # Build wheel
-              python3 -m pip wheel . -w dist --no-build-isolation --no-deps -v
+              build_one () {
+                PYBIN="$1"
+
+                # Clean between builds in case build artifacts are reused
+                rm -rf build/ .eggs/ *.egg-info || true
+
+                "$PYBIN" -m pip install -U pip setuptools wheel build
+
+                # Match your runtime torch (cu124)
+                "$PYBIN" -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+                # Build wheel for this interpreter
+                "$PYBIN" -m pip wheel . -w dist --no-build-isolation --no-deps -v
+              }
+
+              build_one python3.10
+              build_one python3.11
 
               ls -lah dist
             '
@@ -69,6 +86,6 @@ jobs:
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Adjust if your wheel name differs (check dist/ output)
+          # Upload both cp310 and cp311 wheels
           files: dist/cumesh*.whl
           generate_release_notes: true
