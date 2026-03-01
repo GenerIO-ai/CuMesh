@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+env:
+  TORCH_VERSION: "2.5.1"
+  PYTORCH_INDEX_URL: "https://download.pytorch.org/whl/cu124"
+  CUDA_IMAGE: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
+
 jobs:
   build-wheels:
     runs-on: ubuntu-latest
@@ -32,9 +37,11 @@ jobs:
             -e CUDA_HOME=/usr/local/cuda \
             -e CUMESH_COMMIT="${CUMESH_COMMIT}" \
             -e CUBVH_COMMIT="${CUBVH_COMMIT}" \
+            -e TORCH_VERSION="${TORCH_VERSION}" \
+            -e PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL}" \
             -e DEBIAN_FRONTEND=noninteractive \
             -e TZ=Etc/UTC \
-            nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+            "${CUDA_IMAGE}" \
               bash -lc '
                 set -euo pipefail
 
@@ -83,8 +90,9 @@ jobs:
                   python -m pip --version
                   python -m pip install -U pip setuptools wheel build
 
-                  # Match your runtime torch (cu124)
-                  python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+                  # Match the runtime torch ABI exactly.
+                  python -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_INDEX_URL}"
+                  python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
 
                   # Build wheel
                   python -m pip wheel . -w /src/dist --no-build-isolation --no-deps -v
