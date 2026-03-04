@@ -142,6 +142,8 @@ jobs:
         shell: pwsh
         env:
           TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0+PTX"
+          DISTUTILS_USE_SDK: "1"
+          MSSdk: "1"
         run: |
           git fetch --all --tags
           git checkout "$env:CUMESH_COMMIT"
