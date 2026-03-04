@@ -12,10 +12,32 @@ env:
   TORCH_VERSION: "2.5.1"
   PYTORCH_INDEX_URL: "https://download.pytorch.org/whl/cu124"
   CUDA_IMAGE: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
+  CUMESH_COMMIT: c4ad6125924fcedfd13f0bd61520ca2d24eb7a87
+  CUBVH_COMMIT: ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
+  GIT_TERMINAL_PROMPT: "0"
+  PIP_NO_INPUT: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   build-wheels:
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            target: linux_310
+          - os: ubuntu-latest
+            python-version: "3.11"
+            target: linux_311
+          - os: windows-latest
+            python-version: "3.10"
+            target: windows_310
+          - os: windows-latest
+            python-version: "3.11"
+            target: windows_311
 
     steps:
       - name: Checkout
@@ -23,10 +45,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build wheels (cp310 + cp311) inside CUDA container
+      - name: Build wheel inside CUDA container (Linux)
+        if: runner.os == 'Linux'
         env:
-          CUMESH_COMMIT: c4ad6125924fcedfd13f0bd61520ca2d24eb7a87
-          CUBVH_COMMIT: ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
+          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -39,6 +61,10 @@ jobs:
             -e CUBVH_COMMIT="${CUBVH_COMMIT}" \
             -e TORCH_VERSION="${TORCH_VERSION}" \
             -e PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL}" \
+            -e PYTHON_VERSION="${PYTHON_VERSION}" \
+            -e GIT_TERMINAL_PROMPT="${GIT_TERMINAL_PROMPT}" \
+            -e PIP_NO_INPUT="${PIP_NO_INPUT}" \
+            -e PIP_DISABLE_PIP_VERSION_CHECK="${PIP_DISABLE_PIP_VERSION_CHECK}" \
             -e DEBIAN_FRONTEND=noninteractive \
             -e TZ=Etc/UTC \
             "${CUDA_IMAGE}" \
@@ -54,19 +80,17 @@ jobs:
                   software-properties-common \
                   git build-essential ninja-build cmake
 
-                # Install Python 3.10 (default) + Python 3.11
                 add-apt-repository -y ppa:deadsnakes/ppa
                 apt-get update
-
-                # Key change: install distutils + pip packages from apt (no ensurepip)
                 apt-get install -y --no-install-recommends \
-                  python3.10 python3.10-dev python3.10-venv python3.10-distutils \
-                  python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+                  "python${PYTHON_VERSION}" \
+                  "python${PYTHON_VERSION}-dev" \
+                  "python${PYTHON_VERSION}-venv" \
+                  "python${PYTHON_VERSION}-distutils" \
                   python3-pip
 
                 git config --global --add safe.directory "*"
 
-                # Ensure correct commits
                 git fetch --all --tags
                 git checkout "$CUMESH_COMMIT"
                 git submodule update --init --recursive
@@ -76,35 +100,89 @@ jobs:
                 git checkout "$CUBVH_COMMIT"
                 cd /src
 
-                build_one () {
-                  PYBIN="$1"
-                  VENV_DIR=".venv-${PYBIN}"
+                PYBIN="python${PYTHON_VERSION}"
+                VENV_DIR=".venv-${PYBIN}"
 
-                  rm -rf build/ .eggs/ *.egg-info || true
-                  rm -rf "$VENV_DIR" || true
+                rm -rf build/ .eggs/ *.egg-info || true
+                rm -rf "$VENV_DIR" || true
 
-                  # Create an isolated venv; pip will be present (backed by apt pip)
-                  "$PYBIN" -m venv "$VENV_DIR"
-                  . "$VENV_DIR/bin/activate"
+                "$PYBIN" -m venv "$VENV_DIR"
+                . "$VENV_DIR/bin/activate"
 
-                  python -m pip --version
-                  python -m pip install -U pip setuptools wheel build
+                python -m pip --version
+                python -m pip install -U pip setuptools wheel build
+                python -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_INDEX_URL}"
+                python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
 
-                  # Match the runtime torch ABI exactly.
-                  python -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_INDEX_URL}"
-                  python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
+                python -m pip wheel . -w /src/dist --no-build-isolation --no-deps -v
 
-                  # Build wheel
-                  python -m pip wheel . -w /src/dist --no-build-isolation --no-deps -v
-
-                  deactivate
-                }
-
-                build_one python3.10
-                build_one python3.11
-
+                deactivate
                 ls -lah dist
               '
+
+      - name: Setup Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup CUDA Toolkit (Windows)
+        if: runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: "12.4.1"
+          method: "network"
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0+PTX"
+        run: |
+          git fetch --all --tags
+          git checkout "$env:CUMESH_COMMIT"
+          git submodule update --init --recursive
+
+          Push-Location third_party/cubvh
+          git fetch --all --tags
+          git checkout "$env:CUBVH_COMMIT"
+          Pop-Location
+
+          python -m pip install -U pip setuptools wheel build
+          python -m pip install "torch==$env:TORCH_VERSION" --index-url "$env:PYTORCH_INDEX_URL"
+          python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
+
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          Get-ChildItem -Directory -Filter "*.egg-info" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          if (!(Test-Path dist)) { New-Item -ItemType Directory dist | Out-Null }
+
+          python -m pip wheel . -w dist --no-build-isolation --no-deps -v
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/cumesh*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish Release Assets
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -lah dist
 
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v2
