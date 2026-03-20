@@ -32,12 +32,6 @@ jobs:
           - os: ubuntu-latest
             python-version: "3.11"
             target: linux_311
-          - os: windows-latest
-            python-version: "3.10"
-            target: windows_310
-          - os: windows-latest
-            python-version: "3.11"
-            target: windows_311
 
     steps:
       - name: Checkout
@@ -45,8 +39,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build wheel inside CUDA container (Linux)
-        if: runner.os == 'Linux'
+      - name: Build wheel inside CUDA container
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
@@ -119,50 +112,6 @@ jobs:
                 deactivate
                 ls -lah dist
               '
-
-      - name: Setup Python (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Setup CUDA Toolkit (Windows)
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: "12.4.1"
-          method: "network"
-
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0+PTX"
-          DISTUTILS_USE_SDK: "1"
-          MSSdk: "1"
-        run: |
-          git fetch --all --tags
-          git checkout "$env:CUMESH_COMMIT"
-          git submodule update --init --recursive
-
-          Push-Location third_party/cubvh
-          git fetch --all --tags
-          git checkout "$env:CUBVH_COMMIT"
-          Pop-Location
-
-          python -m pip install -U pip setuptools wheel build
-          python -m pip install "torch==$env:TORCH_VERSION" --index-url "$env:PYTORCH_INDEX_URL"
-          python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
-
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          Get-ChildItem -Directory -Filter "*.egg-info" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          if (!(Test-Path dist)) { New-Item -ItemType Directory dist | Out-Null }
-
-          python -m pip wheel . -w dist --no-build-isolation --no-deps -v
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
