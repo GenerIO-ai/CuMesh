@@ -19,3 +19,29 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+GENERIO EXTENSIONS AND ADDITIONS
+
+Copyright (c) 2026 GENERIO GmbH. All rights reserved.
+
+The code and other materials added by GENERIO GmbH to this project, including files or
+portions explicitly identified as GENERIO additions, are proprietary to GENERIO GmbH.
+All rights are reserved. No permission is granted to use, reproduce, modify, distribute,
+or sublicense those GENERIO additions except as expressly authorized in writing by
+GENERIO GmbH.
+
+The GENERIO additions are experimental code provided for evaluation purposes and are
+used at the user's own risk. They are provided "AS IS", without warranties of any kind.
+To the fullest extent permitted by applicable law, GENERIO GmbH shall not be liable for
+any loss, damage, injury, or other harm resulting from or related to the use of the
+GENERIO additions.
+
+GENERIO GmbH may publish an updated license in the future that grants permission to use,
+modify, or distribute the GENERIO additions. Until such an updated license is expressly
+published by GENERIO GmbH, all rights remain reserved and no such permission or license
+should be implied.
+
+This notice does not alter the licenses of the original CuMesh code or third-party
+components. Where a file contains both pre-existing code and GENERIO additions, the
+applicable copyright and license notices for each portion apply.

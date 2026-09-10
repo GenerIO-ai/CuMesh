@@ -33,6 +33,7 @@ Copyright NVIDIA Corporation 2006 -- Ignacio Castano <icastano@nvidia.com>
 #define XATLAS_H
 #include <stddef.h>
 #include <stdint.h>
+#include <vector>
 
 namespace cumesh_xatlas {
 
@@ -166,6 +167,17 @@ struct UvMeshDecl
 };
 
 AddMeshError AddUvMesh(Atlas *atlas, const UvMeshDecl &decl);
+
+bool ParameterizeLscm(
+	const float *positions,
+	uint32_t vertexCount,
+	const int32_t *indices,
+	uint32_t faceCount,
+	std::vector<float> &outUvs,
+	std::vector<int32_t> &outIndices,
+	std::vector<int32_t> &outVmap,
+	int &splitCount
+);
 
 // Custom parameterization function. texcoords initial values are an orthogonal parameterization.
 typedef void (*ParameterizeFunc)(const float *positions, float *texcoords, uint32_t vertexCount, const uint32_t *indices, uint32_t indexCount);

@@ -9,15 +9,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cumesh"
-version = "0.0.1"
+version = "0.9.0"
 description = "Cuda mesh utils"
 requires-python = ">=3.10"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Jianfeng Xiang", email = "belljig@outlook.com" }
+    { name = "Jianfeng Xiang", email = "belljig@outlook.com" },
+    { name = "Uwe Gruenefeld", email = "uwe@generio.ai" },
+    { name = "Mike Ull", email = "mike@generio.ai" }
 ]
 dependencies = [
     "torch==2.5.1",
+    "numpy>=1.24",
+    "scipy>=1.14.1",
     "tqdm",
 ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["cumesh*"]

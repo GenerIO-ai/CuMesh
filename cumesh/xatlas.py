@@ -52,6 +52,24 @@ class Atlas:
 
         self.atlas.add_mesh(vertices, faces, normals, uvs)
 
+    def add_uv_mesh(self, uvs: torch.Tensor, faces: torch.Tensor, face_materials: Optional[torch.Tensor] = None):
+        assert uvs.ndim == 2 and uvs.shape[1] == 2, "uvs must be [V, 2]"
+        assert uvs.dtype == torch.float32, "uvs must be float32"
+        assert uvs.device.type == 'cpu', "uvs must be on CPU"
+        assert uvs.is_contiguous(), "uvs must be contiguous"
+
+        assert faces.ndim == 2 and faces.shape[1] == 3, "faces must be [F, 3]"
+        assert faces.dtype == torch.int32, "faces must be int32"
+        assert faces.device.type == 'cpu', "faces must be on CPU"
+        assert faces.is_contiguous(), "faces must be contiguous"
+
+        if face_materials is not None:
+            assert face_materials.dtype == torch.int32, "face_materials must be int32"
+            assert face_materials.device.type == 'cpu', "face_materials must be on CPU"
+            assert face_materials.is_contiguous(), "face_materials must be contiguous"
+
+        self.atlas.add_uv_mesh(uvs, faces, face_materials)
+
     def compute_charts(self, 
                        max_chart_area: float = 0.0,
                        max_boundary_length: float = 0.0,
@@ -179,4 +197,17 @@ class Atlas:
             return True # Continue processing
 
         return callback
-    
+
+
+def parameterize_lscm(vertices: torch.Tensor, faces: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, int]:
+    assert vertices.ndim == 2 and vertices.shape[1] == 3
+    assert vertices.dtype == torch.float32
+    assert vertices.device.type == 'cpu'
+    assert vertices.is_contiguous()
+
+    assert faces.ndim == 2 and faces.shape[1] == 3
+    assert faces.dtype == torch.int32
+    assert faces.device.type == 'cpu'
+    assert faces.is_contiguous()
+
+    return _xatlas.parameterize_lscm(vertices, faces)

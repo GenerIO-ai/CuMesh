@@ -1,0 +1,6 @@
+include LICENSE README.md pyproject.toml setup.py
+recursive-include cumesh *.py
+recursive-include src *.cu *.cuh *.cpp *.h
+recursive-include third_party/xatlas *.cpp *.h LICENSE
+recursive-include third_party/cubvh *.cu *.cuh *.cpp *.h LICENSE LICENSE_NVIDIA
+recursive-include third_party/cubvh/third_party/eigen *

@@ -1173,8 +1173,227 @@ void CuMesh::compute_charts(
     }
     CUDA_CHECK(cudaFree(cu_end_flag));
 
-    // Finalizing: calculate vmap, chart face and chart face offset
     construct_chart_mesh(*this);
+}
+
+
+static __global__ void count_chart_faces_kernel(
+    const int* chart_ids,
+    const size_t F,
+    int* chart_face_counts
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= F) return;
+    int c = chart_ids[tid];
+    atomicAdd(&chart_face_counts[c], 1);
+}
+
+
+static __global__ void evaluate_micro_chart_merges_kernel(
+    const int* chart2edge,
+    const int* chart2edge_offset,
+    const uint64_t* chart_adj,
+    const float* chart_adj_length,
+    const float* chart_perims,
+    const float* chart_areas,
+    const int* chart_face_counts,
+    const float4* chart_normal_cones,
+    const float total_area,
+    const float min_area_ratio,
+    const int min_faces,
+    const float min_enclosure,
+    const float max_cone_half_angle_rad,
+    const int num_charts,
+    int* chart_parents,
+    int* merge_count
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_charts) return;
+
+    float area = chart_areas[c];
+    int faces = chart_face_counts[c];
+    bool is_tiny = (area < total_area * min_area_ratio) || (faces < min_faces);
+    if (!is_tiny) return;
+
+    float perim = chart_perims[c];
+    if (perim <= 1e-7f) return;
+
+    int start = chart2edge_offset[c];
+    int end = chart2edge_offset[c + 1];
+    int best_neighbor = -1;
+    float max_shared = 0.0f;
+
+    for (int e = start; e < end; e++) {
+        int eid = chart2edge[e];
+        uint64_t adj = chart_adj[eid];
+        int c0 = int(adj >> 32);
+        int c1 = int(adj & 0xFFFFFFFF);
+        int neighbor = (c0 == c) ? c1 : c0;
+        float len = chart_adj_length[eid];
+        if (len > max_shared) {
+            max_shared = len;
+            best_neighbor = neighbor;
+        }
+    }
+
+    if (best_neighbor < 0 || max_shared <= 0.0f) return;
+
+    if (chart_face_counts[best_neighbor] > faces ||
+        (chart_face_counts[best_neighbor] == faces && chart_areas[best_neighbor] > area) ||
+        (chart_face_counts[best_neighbor] == faces && chart_areas[best_neighbor] == area && best_neighbor < c) ||
+        (chart_face_counts[best_neighbor] >= min_faces)) {
+        chart_parents[c] = best_neighbor;
+        atomicAdd(merge_count, 1);
+    }
+}
+
+
+static __global__ void flatten_chart_parents_kernel(
+    int* chart_parents,
+    const int num_charts
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_charts) return;
+    int curr = tid;
+    while (curr != chart_parents[curr]) {
+        curr = chart_parents[curr];
+    }
+    chart_parents[tid] = curr;
+}
+
+
+static __global__ void apply_chart_remap_kernel(
+    int* chart_ids,
+    const int* chart_parents,
+    const size_t F
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= F) return;
+    chart_ids[tid] = chart_parents[chart_ids[tid]];
+}
+
+
+int CuMesh::merge_micro_charts(
+    float min_area_ratio,
+    int min_faces,
+    float min_enclosure,
+    int merge_iterations,
+    float max_cone_half_angle_rad
+) {
+    if (this->atlas_num_charts <= 1) {
+        return 0;
+    }
+    size_t F = this->faces.size;
+    int total_merges = 0;
+
+    int* cu_merge_count;
+    CUDA_CHECK(cudaMalloc(&cu_merge_count, sizeof(int)));
+
+    for (int iter = 0; iter < merge_iterations; iter++) {
+        if (this->atlas_num_charts <= 1) {
+            break;
+        }
+
+        get_chart_connectivity(*this);
+        if (this->atlas_chart_adj.size == 0) {
+            break;
+        }
+
+        compute_chart_normal_cones(*this);
+
+        size_t C = this->atlas_num_charts;
+
+        int* cu_chart_face_counts;
+        CUDA_CHECK(cudaMalloc(&cu_chart_face_counts, C * sizeof(int)));
+        CUDA_CHECK(cudaMemset(cu_chart_face_counts, 0, C * sizeof(int)));
+
+        count_chart_faces_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            this->atlas_chart_ids.ptr,
+            F,
+            cu_chart_face_counts
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        float* cu_total_area;
+        CUDA_CHECK(cudaMalloc(&cu_total_area, sizeof(float)));
+        size_t temp_storage_bytes = 0;
+        CUDA_CHECK(cub::DeviceReduce::Sum(
+            nullptr, temp_storage_bytes,
+            this->atlas_chart_areas.ptr, cu_total_area, C
+        ));
+        this->cub_temp_storage.resize(temp_storage_bytes);
+        CUDA_CHECK(cub::DeviceReduce::Sum(
+            this->cub_temp_storage.ptr, temp_storage_bytes,
+            this->atlas_chart_areas.ptr, cu_total_area, C
+        ));
+        float h_total_area = 0.0f;
+        CUDA_CHECK(cudaMemcpy(&h_total_area, cu_total_area, sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(cu_total_area));
+
+        int* cu_chart_parents;
+        CUDA_CHECK(cudaMalloc(&cu_chart_parents, C * sizeof(int)));
+        arange_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            cu_chart_parents,
+            C
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaMemset(cu_merge_count, 0, sizeof(int)));
+
+        evaluate_micro_chart_merges_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            this->atlas_chart2edge.ptr,
+            this->atlas_chart2edge_offset.ptr,
+            this->atlas_chart_adj.ptr,
+            this->atlas_chart_adj_length.ptr,
+            this->atlas_chart_perims.ptr,
+            this->atlas_chart_areas.ptr,
+            cu_chart_face_counts,
+            this->atlas_chart_normal_cones.ptr,
+            h_total_area,
+            min_area_ratio,
+            min_faces,
+            min_enclosure,
+            max_cone_half_angle_rad,
+            C,
+            cu_chart_parents,
+            cu_merge_count
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        int h_merges = 0;
+        CUDA_CHECK(cudaMemcpy(&h_merges, cu_merge_count, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(cu_chart_face_counts));
+
+        if (h_merges == 0) {
+            CUDA_CHECK(cudaFree(cu_chart_parents));
+            break;
+        }
+
+        flatten_chart_parents_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            cu_chart_parents,
+            C
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        apply_chart_remap_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+            this->atlas_chart_ids.ptr,
+            cu_chart_parents,
+            F
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaFree(cu_chart_parents));
+
+        this->atlas_num_charts = compress_ids(this->atlas_chart_ids.ptr, F, this->cub_temp_storage);
+        total_merges += h_merges;
+    }
+
+    CUDA_CHECK(cudaFree(cu_merge_count));
+
+    reassign_chart_ids(*this);
+    construct_chart_mesh(*this);
+
+    return total_merges;
 }
 
 

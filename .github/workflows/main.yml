@@ -12,8 +12,6 @@ env:
   TORCH_VERSION: "2.5.1"
   PYTORCH_INDEX_URL: "https://download.pytorch.org/whl/cu124"
   CUDA_IMAGE: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
-  CUMESH_COMMIT: c4ad6125924fcedfd13f0bd61520ca2d24eb7a87
-  CUBVH_COMMIT: ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70
   GIT_TERMINAL_PROMPT: "0"
   PIP_NO_INPUT: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -50,8 +48,6 @@ jobs:
             -v "${PWD}:/src" -w /src \
             -e TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX" \
             -e CUDA_HOME=/usr/local/cuda \
-            -e CUMESH_COMMIT="${CUMESH_COMMIT}" \
-            -e CUBVH_COMMIT="${CUBVH_COMMIT}" \
             -e TORCH_VERSION="${TORCH_VERSION}" \
             -e PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL}" \
             -e PYTHON_VERSION="${PYTHON_VERSION}" \
@@ -71,7 +67,7 @@ jobs:
                 apt-get install -y --no-install-recommends \
                   ca-certificates curl \
                   software-properties-common \
-                  git build-essential ninja-build cmake
+                  git build-essential ninja-build cmake libeigen3-dev
 
                 add-apt-repository -y ppa:deadsnakes/ppa
                 apt-get update
@@ -81,17 +77,6 @@ jobs:
                   "python${PYTHON_VERSION}-venv" \
                   "python${PYTHON_VERSION}-distutils" \
                   python3-pip
-
-                git config --global --add safe.directory "*"
-
-                git fetch --all --tags
-                git checkout "$CUMESH_COMMIT"
-                git submodule update --init --recursive
-
-                cd third_party/cubvh
-                git fetch --all --tags
-                git checkout "$CUBVH_COMMIT"
-                cd /src
 
                 PYBIN="python${PYTHON_VERSION}"
                 VENV_DIR=".venv-${PYBIN}"
@@ -103,10 +88,12 @@ jobs:
                 . "$VENV_DIR/bin/activate"
 
                 python -m pip --version
-                python -m pip install -U pip setuptools wheel build
+                python -m pip install -U pip setuptools wheel
                 python -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_INDEX_URL}"
                 python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
 
+                export EIGEN3_INCLUDE_DIR=/usr/include/eigen3
+                test -f "$EIGEN3_INCLUDE_DIR/Eigen/Core"
                 python -m pip wheel . -w /src/dist --no-build-isolation --no-deps -v
 
                 deactivate

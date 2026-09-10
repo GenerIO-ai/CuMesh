@@ -60,6 +60,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)
         .def("compute_charts", &cumesh::CuMesh::compute_charts)
+        .def("merge_micro_charts", &cumesh::CuMesh::merge_micro_charts,
+            py::arg("min_area_ratio") = 0.0005f,
+            py::arg("min_faces") = 128,
+            py::arg("min_enclosure") = 0.60f,
+            py::arg("merge_iterations") = 3,
+            py::arg("max_cone_half_angle_rad") = 1.5707963f
+        )
         .def("read_atlas_charts", &cumesh::CuMesh::read_atlas_charts);
 
     // Remeshing functions

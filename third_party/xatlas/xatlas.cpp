@@ -6339,7 +6339,7 @@ static bool findApproximateDiameterVertices(Mesh *mesh, uint32_t *a, uint32_t *b
 	uint32_t maxVertex[3];
 	minVertex[0] = minVertex[1] = minVertex[2] = UINT32_MAX;
 	maxVertex[0] = maxVertex[1] = maxVertex[2] = UINT32_MAX;
-	for (uint32_t v = 1; v < vertexCount; v++) {
+	for (uint32_t v = 0; v < vertexCount; v++) {
 		if (mesh->isBoundaryVertex(v)) {
 			minVertex[0] = minVertex[1] = minVertex[2] = v;
 			maxVertex[0] = maxVertex[1] = maxVertex[2] = v;
@@ -6347,12 +6347,10 @@ static bool findApproximateDiameterVertices(Mesh *mesh, uint32_t *a, uint32_t *b
 		}
 	}
 	if (minVertex[0] == UINT32_MAX) {
-		// Input mesh has not boundaries.
 		return false;
 	}
-	for (uint32_t v = 1; v < vertexCount; v++) {
+	for (uint32_t v = 0; v < vertexCount; v++) {
 		if (!mesh->isBoundaryVertex(v)) {
-			// Skip interior vertices.
 			continue;
 		}
 		const Vector3 &pos = mesh->position(v);
@@ -6373,21 +6371,42 @@ static bool findApproximateDiameterVertices(Mesh *mesh, uint32_t *a, uint32_t *b
 	for (int i = 0; i < 3; i++) {
 		lengths[i] = length(mesh->position(minVertex[i]) - mesh->position(maxVertex[i]));
 	}
-	if (lengths[0] > lengths[1] && lengths[0] > lengths[2]) {
-		*a = minVertex[0];
-		*b = maxVertex[0];
-	} else if (lengths[1] > lengths[2]) {
-		*a = minVertex[1];
-		*b = maxVertex[1];
-	} else {
-		*a = minVertex[2];
-		*b = maxVertex[2];
+	int bestAxis = 0;
+	if (lengths[1] > lengths[bestAxis]) bestAxis = 1;
+	if (lengths[2] > lengths[bestAxis]) bestAxis = 2;
+	*a = minVertex[bestAxis];
+	*b = maxVertex[bestAxis];
+
+	if (*a == *b || lengths[bestAxis] <= 1e-7f) {
+		float maxDist = -1.0f;
+		for (uint32_t u = 0; u < vertexCount; u++) {
+			if (!mesh->isBoundaryVertex(u)) continue;
+			for (uint32_t v = u + 1; v < vertexCount; v++) {
+				if (!mesh->isBoundaryVertex(v)) continue;
+				float d = length(mesh->position(u) - mesh->position(v));
+				if (d > maxDist) {
+					maxDist = d;
+					*a = u;
+					*b = v;
+				}
+			}
+		}
+		if (*a == *b || maxDist <= 1e-7f) {
+			for (uint32_t u = 0; u < vertexCount; u++) {
+				for (uint32_t v = u + 1; v < vertexCount; v++) {
+					float d = length(mesh->position(u) - mesh->position(v));
+					if (d > maxDist) {
+						maxDist = d;
+						*a = u;
+						*b = v;
+					}
+				}
+			}
+		}
 	}
-	return true;
+	return (*a != *b);
 }
 
-// From OpenNL LSCM example.
-// Computes the coordinates of the vertices of a triangle in a local 2D orthonormal basis of the triangle's plane.
 static void projectTriangle(Vector3 p0, Vector3 p1, Vector3 p2, Vector2 *z0, Vector2 *z1, Vector2 *z2)
 {
 	Vector3 X = normalize(p1 - p0);
@@ -6398,8 +6417,6 @@ static void projectTriangle(Vector3 p0, Vector3 p1, Vector3 p2, Vector2 *z0, Vec
 	*z1 = Vector2(length(p1 - O), 0);
 	*z2 = Vector2(dot(p2 - O, X), dot(p2 - O, Y));
 }
-
-// Conformal relations from Brecht Van Lommel (based on ABF):
 
 static float vec_angle_cos(const Vector3 &v1, const Vector3 &v2, const Vector3 &v3)
 {
@@ -6423,9 +6440,6 @@ static void triangle_angles(const Vector3 &v1, const Vector3 &v2, const Vector3 
 
 static bool setup_abf_relations(opennl::NLContext *context, int id0, int id1, int id2, const Vector3 &p0, const Vector3 &p1, const Vector3 &p2)
 {
-	// @@ IC: Wouldn't it be more accurate to return cos and compute 1-cos^2?
-	// It does indeed seem to be a little bit more robust.
-	// @@ Need to revisit this more carefully!
 	float a0, a1, a2;
 	triangle_angles(p0, p1, p2, &a0, &a1, &a2);
 	if (a0 == 0.0f || a1 == 0.0f || a2 == 0.0f)
@@ -6452,15 +6466,12 @@ static bool setup_abf_relations(opennl::NLContext *context, int id0, int id1, in
 	float ratio = (s2 == 0.0f) ? 1.0f : s1 / s2;
 	float cosine = c0 * ratio;
 	float sine = s0 * ratio;
-	// Note  : 2*id + 0 --> u
-	//         2*id + 1 --> v
 	int u0_id = 2 * id0 + 0;
 	int v0_id = 2 * id0 + 1;
 	int u1_id = 2 * id1 + 0;
 	int v1_id = 2 * id1 + 1;
 	int u2_id = 2 * id2 + 0;
 	int v2_id = 2 * id2 + 1;
-	// Real part
 	opennl::nlBegin(context, NL_ROW);
 	opennl::nlCoefficient(context, u0_id, cosine - 1.0f);
 	opennl::nlCoefficient(context, v0_id, -sine);
@@ -6468,7 +6479,6 @@ static bool setup_abf_relations(opennl::NLContext *context, int id0, int id1, in
 	opennl::nlCoefficient(context, v1_id, sine);
 	opennl::nlCoefficient(context, u2_id, 1);
 	opennl::nlEnd(context, NL_ROW);
-	// Imaginary part
 	opennl::nlBegin(context, NL_ROW);
 	opennl::nlCoefficient(context, u0_id, sine);
 	opennl::nlCoefficient(context, v0_id, cosine - 1.0f);
@@ -6483,9 +6493,9 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 {
 	uint32_t lockedVertex0, lockedVertex1;
 	if (!findApproximateDiameterVertices(mesh, &lockedVertex0, &lockedVertex1)) {
-		// Mesh has no boundaries.
 		return false;
 	}
+	const float pinDist = length(mesh->position(lockedVertex1) - mesh->position(lockedVertex0));
 	const uint32_t vertexCount = mesh->vertexCount();
 	opennl::NLContext *context = opennl::nlNewContext();
 	opennl::nlSolverParameteri(context, NL_NB_VARIABLES, int(2 * vertexCount));
@@ -6493,6 +6503,11 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 	opennl::nlBegin(context, NL_SYSTEM);
 	ArrayView<Vector2> texcoords = mesh->texcoords();
 	for (uint32_t i = 0; i < vertexCount; i++) {
+		if (i == lockedVertex0) {
+			texcoords[i] = Vector2(0.0f, 0.0f);
+		} else if (i == lockedVertex1) {
+			texcoords[i] = Vector2(pinDist > 1e-6f ? pinDist : 1.0f, 0.0f);
+		}
 		opennl::nlSetVariable(context, 2 * i, texcoords[i].x);
 		opennl::nlSetVariable(context, 2 * i + 1, texcoords[i].y);
 		if (i == lockedVertex0 || i == lockedVertex1) {
@@ -6516,16 +6531,12 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 			double c = z2.x - z0.x;
 			double d = z2.y - z0.y;
 			XA_DEBUG_ASSERT(b == 0.0);
-			// Note  : 2*id + 0 --> u
-			//         2*id + 1 --> v
 			uint32_t u0_id = 2 * v0;
 			uint32_t v0_id = 2 * v0 + 1;
 			uint32_t u1_id = 2 * v1;
 			uint32_t v1_id = 2 * v1 + 1;
 			uint32_t u2_id = 2 * v2;
 			uint32_t v2_id = 2 * v2 + 1;
-			// Note : b = 0
-			// Real part
 			opennl::nlBegin(context, NL_ROW);
 			opennl::nlCoefficient(context, u0_id, -a+c) ;
 			opennl::nlCoefficient(context, v0_id, b-d) ;
@@ -6533,7 +6544,6 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 			opennl::nlCoefficient(context, v1_id, d) ;
 			opennl::nlCoefficient(context, u2_id, a);
 			opennl::nlEnd(context, NL_ROW);
-			// Imaginary part
 			opennl::nlBegin(context, NL_ROW);
 			opennl::nlCoefficient(context, u0_id, -b+d);
 			opennl::nlCoefficient(context, v0_id, -a+c);
@@ -6552,12 +6562,267 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 	for (uint32_t i = 0; i < vertexCount; i++) {
 		const double u = opennl::nlGetVariable(context, 2 * i);
 		const double v = opennl::nlGetVariable(context, 2 * i + 1);
+		if (!isFinite(u) || !isFinite(v) || isNan(u) || isNan(v)) {
+			opennl::nlDeleteContext(context);
+			return false;
+		}
 		texcoords[i] = Vector2((float)u, (float)v);
-		XA_DEBUG_ASSERT(!isNan(mesh->texcoord(i).x));
-		XA_DEBUG_ASSERT(!isNan(mesh->texcoord(i).y));
 	}
 	opennl::nlDeleteContext(context);
 	return true;
+}
+
+
+bool ParameterizeLscmImpl(
+	const float *positions,
+	uint32_t vertexCount,
+	const int32_t *indices,
+	uint32_t faceCount,
+	std::vector<float> &outUvs,
+	std::vector<int32_t> &outIndices,
+	std::vector<int32_t> &outVmap,
+	int &splitCount
+)
+{
+	splitCount = 0;
+	if (vertexCount < 3 || faceCount == 0) {
+		return false;
+	}
+
+	std::vector<Vector3> curPositions(vertexCount);
+	std::vector<int32_t> curVmap(vertexCount);
+	for (uint32_t i = 0; i < vertexCount; i++) {
+		curPositions[i] = Vector3(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2]);
+		curVmap[i] = (int32_t)i;
+	}
+
+	std::vector<uint32_t> curIndices(faceCount * 3);
+	for (uint32_t i = 0; i < faceCount * 3; i++) {
+		curIndices[i] = (uint32_t)indices[i];
+	}
+
+	for (int retry = 0; retry < 4; retry++) {
+		uint32_t curVCount = (uint32_t)curPositions.size();
+		uint32_t curFCount = (uint32_t)(curIndices.size() / 3);
+		Mesh mesh(0.0f, curVCount, curFCount);
+		for (uint32_t i = 0; i < curVCount; i++) {
+			mesh.addVertex(curPositions[i]);
+		}
+		for (uint32_t f = 0; f < curFCount; f++) {
+			mesh.addFace(&curIndices[f * 3]);
+		}
+		mesh.createColocals();
+		mesh.createBoundaries();
+
+		if (mesh.boundaryEdges().isEmpty()) {
+			uint32_t vA = 0, vB = 0;
+			float maxDistSq = -1.0f;
+			for (uint32_t i = 0; i < curVCount; i++) {
+				for (uint32_t j = i + 1; j < curVCount; j++) {
+					Vector3 diff = curPositions[i] - curPositions[j];
+					float dsq = dot(diff, diff);
+					if (dsq > maxDistSq) {
+						maxDistSq = dsq;
+						vA = i;
+						vB = j;
+					}
+				}
+			}
+
+			std::vector<std::vector<uint32_t>> adj(curVCount);
+			for (uint32_t f = 0; f < curFCount; f++) {
+				uint32_t i0 = curIndices[f * 3 + 0];
+				uint32_t i1 = curIndices[f * 3 + 1];
+				uint32_t i2 = curIndices[f * 3 + 2];
+				adj[i0].push_back(i1); adj[i0].push_back(i2);
+				adj[i1].push_back(i0); adj[i1].push_back(i2);
+				adj[i2].push_back(i0); adj[i2].push_back(i1);
+			}
+
+			std::vector<int> prev(curVCount, -1);
+			std::vector<uint32_t> q;
+			q.push_back(vA);
+			prev[vA] = (int)vA;
+			uint32_t head = 0;
+			while (head < q.size()) {
+				uint32_t u = q[head++];
+				if (u == vB) break;
+				for (uint32_t nxt : adj[u]) {
+					if (prev[nxt] == -1) {
+						prev[nxt] = (int)u;
+						q.push_back(nxt);
+					}
+				}
+			}
+
+			std::vector<uint32_t> path;
+			int curr = (int)vB;
+			while (curr != -1 && (uint32_t)curr != vA) {
+				path.push_back((uint32_t)curr);
+				curr = prev[curr];
+			}
+			path.push_back(vA);
+
+			for (size_t pi = 0; pi + 1 < path.size(); pi++) {
+				uint32_t u = path[pi];
+				uint32_t v = path[pi + 1];
+				uint32_t newV = (uint32_t)curPositions.size();
+				curPositions.push_back(curPositions[v]);
+				curVmap.push_back(curVmap[v]);
+				for (uint32_t f = 0; f < curFCount; f++) {
+					uint32_t i0 = curIndices[f * 3 + 0];
+					uint32_t i1 = curIndices[f * 3 + 1];
+					uint32_t i2 = curIndices[f * 3 + 2];
+					if ((i0 == u && i1 == v) || (i1 == u && i2 == v) || (i2 == u && i0 == v)) {
+						if (curIndices[f * 3 + 0] == v) curIndices[f * 3 + 0] = newV;
+						if (curIndices[f * 3 + 1] == v) curIndices[f * 3 + 1] = newV;
+						if (curIndices[f * 3 + 2] == v) curIndices[f * 3 + 2] = newV;
+						break;
+					}
+				}
+			}
+			splitCount++;
+			continue;
+		}
+
+		Vector3 normal(0.0f);
+		for (uint32_t f = 0; f < curFCount; f++) {
+			Vector3 p0 = mesh.position(mesh.vertexAt(f * 3 + 0));
+			Vector3 p1 = mesh.position(mesh.vertexAt(f * 3 + 1));
+			Vector3 p2 = mesh.position(mesh.vertexAt(f * 3 + 2));
+			normal += cross(p1 - p0, p2 - p0);
+		}
+		if (dot(normal, normal) > 1e-12f) {
+			normal = normalize(normal);
+		} else {
+			normal = Vector3(0, 0, 1);
+		}
+		Basis basis;
+		basis.normal = normal;
+		basis.tangent = Basis::computeTangent(normal);
+		basis.bitangent = Basis::computeBitangent(normal, basis.tangent);
+		for (uint32_t i = 0; i < curVCount; i++) {
+			mesh.texcoord(i) = Vector2(dot(basis.tangent, mesh.position(i)), dot(basis.bitangent, mesh.position(i)));
+		}
+
+		bool solved = computeLeastSquaresConformalMap(&mesh);
+		if (!solved && retry < 3) {
+			splitCount++;
+			continue;
+		}
+
+		float totalParametricArea = 0.0f;
+		for (uint32_t f = 0; f < curFCount; f++) {
+			totalParametricArea += mesh.computeFaceParametricArea(f);
+		}
+		if (totalParametricArea < 0.0f) {
+			for (uint32_t v = 0; v < curVCount; v++) {
+				mesh.texcoord(v).x *= -1.0f;
+			}
+		}
+
+		int flippedCount = 0;
+		int worstFlippedFace = -1;
+		float worstFlippedArea = 0.0f;
+		for (uint32_t f = 0; f < curFCount; f++) {
+			float fa = mesh.computeFaceParametricArea(f);
+			if (fa <= 0.0f) {
+				flippedCount++;
+				if (fa < worstFlippedArea) {
+					worstFlippedArea = fa;
+					worstFlippedFace = (int)f;
+				}
+			}
+		}
+
+		if (flippedCount == 0 || retry == 3 || worstFlippedFace < 0) {
+			outUvs.resize(curVCount * 2);
+			for (uint32_t v = 0; v < curVCount; v++) {
+				outUvs[v * 2 + 0] = mesh.texcoord(v).x;
+				outUvs[v * 2 + 1] = mesh.texcoord(v).y;
+			}
+			outIndices.resize(curIndices.size());
+			for (size_t i = 0; i < curIndices.size(); i++) {
+				outIndices[i] = (int32_t)curIndices[i];
+			}
+			outVmap = curVmap;
+			return solved;
+		}
+
+		uint32_t targetV = curIndices[worstFlippedFace * 3 + 0];
+		uint32_t closestBoundaryV = targetV;
+		float minBndDistSq = 1e30f;
+		for (uint32_t v = 0; v < curVCount; v++) {
+			if (mesh.isBoundaryVertex(v)) {
+				Vector3 d = curPositions[v] - curPositions[targetV];
+				float dsq = dot(d, d);
+				if (dsq < minBndDistSq) {
+					minBndDistSq = dsq;
+					closestBoundaryV = v;
+				}
+			}
+		}
+
+		std::vector<std::vector<uint32_t>> adj(curVCount);
+		for (uint32_t f = 0; f < curFCount; f++) {
+			uint32_t i0 = curIndices[f * 3 + 0];
+			uint32_t i1 = curIndices[f * 3 + 1];
+			uint32_t i2 = curIndices[f * 3 + 2];
+			adj[i0].push_back(i1); adj[i0].push_back(i2);
+			adj[i1].push_back(i0); adj[i1].push_back(i2);
+			adj[i2].push_back(i0); adj[i2].push_back(i1);
+		}
+
+		std::vector<int> prev(curVCount, -1);
+		std::vector<bool> visited(curVCount, false);
+		std::vector<uint32_t> queue;
+		queue.push_back(closestBoundaryV);
+		visited[closestBoundaryV] = true;
+		size_t head = 0;
+		while (head < queue.size()) {
+			uint32_t u = queue[head++];
+			if (u == targetV) break;
+			for (uint32_t nxt : adj[u]) {
+				if (!visited[nxt]) {
+					visited[nxt] = true;
+					prev[nxt] = (int)u;
+					queue.push_back(nxt);
+				}
+			}
+		}
+
+		std::vector<uint32_t> path;
+		int curr = (int)targetV;
+		while (curr != -1) {
+			path.push_back((uint32_t)curr);
+			if ((uint32_t)curr == closestBoundaryV) break;
+			curr = prev[curr];
+		}
+
+		if (path.size() >= 2) {
+			for (size_t k = 1; k < path.size(); k++) {
+				uint32_t u = path[k - 1];
+				uint32_t v = path[k];
+				uint32_t newV = (uint32_t)curPositions.size();
+				curPositions.push_back(curPositions[v]);
+				curVmap.push_back(curVmap[v]);
+				for (uint32_t f = 0; f < curFCount; f++) {
+					uint32_t i0 = curIndices[f * 3 + 0];
+					uint32_t i1 = curIndices[f * 3 + 1];
+					uint32_t i2 = curIndices[f * 3 + 2];
+					if ((i0 == u && i1 == v) || (i1 == u && i2 == v) || (i2 == u && i0 == v)) {
+						if (curIndices[f * 3 + 0] == v) curIndices[f * 3 + 0] = newV;
+						if (curIndices[f * 3 + 1] == v) curIndices[f * 3 + 1] = newV;
+						if (curIndices[f * 3 + 2] == v) curIndices[f * 3 + 2] = newV;
+						break;
+					}
+				}
+			}
+			splitCount++;
+		}
+	}
+
+	return false;
 }
 
 struct PiecewiseParam
@@ -9340,7 +9605,7 @@ AddMeshError AddUvMesh(Atlas *atlas, const UvMeshDecl &decl)
 				const internal::Vector2 &v2 = mesh->texcoords[tri[1]];
 				const internal::Vector2 &v3 = mesh->texcoords[tri[2]];
 				const float area = fabsf(((v2.x - v1.x) * (v3.y - v1.y) - (v3.x - v1.x) * (v2.y - v1.y)) * 0.5f);
-				if (area <= internal::kAreaEpsilon) {
+				if (area <= 1e-18f) {
 					ignore = true;
 					if (++warningCount <= kMaxWarnings)
 						XA_PRINT("   Zero area face: %d, indices (%d %d %d), area is %f\n", f, tri[0], tri[1], tri[2], area);
@@ -9564,8 +9829,9 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 			return;
 		}
 	} else if (!ctx->uvMeshChartsComputed) {
-		XA_PRINT_WARNING("PackCharts: ComputeCharts must be called first.\n");
-		return;
+		if (!internal::segment::computeUvMeshCharts(ctx->taskScheduler, ctx->uvMeshes, ctx->progressFunc, ctx->progressUserData))
+			return;
+		ctx->uvMeshChartsComputed = true;
 	}
 	if (packOptions.texelsPerUnit < 0.0f) {
 		XA_PRINT_WARNING("PackCharts: PackOptions::texelsPerUnit is negative.\n");
@@ -9823,9 +10089,29 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 				vertex.xref = v;
 				const uint32_t meshChartIndex = mesh->mesh->vertexToChartMap[v];
 				if (meshChartIndex == UINT32_MAX) {
-					// Vertex doesn't exist in any chart.
-					vertex.atlasIndex = -1;
-					vertex.chartIndex = -1;
+					uint32_t fallback = UINT32_MAX;
+					for (size_t f = 0; f < mesh->mesh->indices.size(); f += 3) {
+						uint32_t i0 = mesh->mesh->indices[f + 0];
+						uint32_t i1 = mesh->mesh->indices[f + 1];
+						uint32_t i2 = mesh->mesh->indices[f + 2];
+						if (i0 == v || i1 == v || i2 == v) {
+							if (i0 != v && mesh->mesh->vertexToChartMap[i0] != UINT32_MAX) fallback = i0;
+							else if (i1 != v && mesh->mesh->vertexToChartMap[i1] != UINT32_MAX) fallback = i1;
+							else if (i2 != v && mesh->mesh->vertexToChartMap[i2] != UINT32_MAX) fallback = i2;
+							if (fallback != UINT32_MAX) break;
+						}
+					}
+					if (fallback != UINT32_MAX) {
+						const uint32_t fbChart = mesh->mesh->vertexToChartMap[fallback];
+						const internal::pack::Chart *chart = packAtlas.getChart(chartIndex + fbChart);
+						vertex.atlasIndex = chart->atlasIndex;
+						vertex.chartIndex = (int32_t)chartIndex + fbChart;
+						vertex.uv[0] = mesh->texcoords[fallback].x;
+						vertex.uv[1] = mesh->texcoords[fallback].y;
+					} else {
+						vertex.atlasIndex = -1;
+						vertex.chartIndex = -1;
+					}
 				} else {
 					const internal::pack::Chart *chart = packAtlas.getChart(chartIndex + meshChartIndex);
 					vertex.atlasIndex = chart->atlasIndex;
@@ -9929,6 +10215,20 @@ const char *StringForEnum(ProgressCategory category)
 	if (category == ProgressCategory::BuildOutputMeshes)
 		return "Building output meshes";
 	return "";
+}
+
+bool ParameterizeLscm(
+	const float *positions,
+	uint32_t vertexCount,
+	const int32_t *indices,
+	uint32_t faceCount,
+	std::vector<float> &outUvs,
+	std::vector<int32_t> &outIndices,
+	std::vector<int32_t> &outVmap,
+	int &splitCount
+)
+{
+	return internal::param::ParameterizeLscmImpl(positions, vertexCount, indices, faceCount, outUvs, outIndices, outVmap, splitCount);
 }
 
 } // namespace cumesh_xatlas

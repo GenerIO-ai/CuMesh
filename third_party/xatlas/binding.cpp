@@ -1,6 +1,13 @@
 #include <torch/extension.h>
 #include "xatlas.h"
 
+#include <cstring>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
 
 namespace cumesh_xatlas {
 
@@ -142,10 +149,73 @@ public:
 
         return std::make_tuple(mapping, faces, uv);
     }
+
+    void AddUvMesh(
+        const torch::Tensor& uvs,
+        const torch::Tensor& faces,
+        std::optional<const torch::Tensor> faceMaterials
+    ) {
+        check_tensor(uvs, "uvs", torch::kFloat32);
+        check_tensor(faces, "faces", torch::kInt32);
+
+        cumesh_xatlas::UvMeshDecl decl;
+        decl.vertexCount = static_cast<uint32_t>(uvs.size(0));
+        decl.vertexUvData = uvs.data_ptr<float>();
+        decl.vertexStride = sizeof(float) * 2;
+        decl.indexCount = static_cast<uint32_t>(faces.size(0) * 3);
+        decl.indexData = faces.data_ptr<int32_t>();
+        decl.indexFormat = cumesh_xatlas::IndexFormat::UInt32;
+        if (faceMaterials.has_value()) {
+            check_tensor(*faceMaterials, "faceMaterials", torch::kInt32);
+            decl.faceMaterialData = reinterpret_cast<const uint32_t*>(faceMaterials->data_ptr<int32_t>());
+        }
+
+        cumesh_xatlas::AddMeshError result = cumesh_xatlas::AddUvMesh(m_atlas, decl);
+        if (result != cumesh_xatlas::AddMeshError::Success) {
+            throw std::runtime_error("Adding UV mesh failed: " + std::string(cumesh_xatlas::StringForEnum(result)));
+        }
+    }
 };
 
+inline std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, bool, int> ParameterizeLscmBinding(
+    const torch::Tensor& vertices,
+    const torch::Tensor& faces
+) {
+    check_tensor(vertices, "vertices", torch::kFloat32);
+    check_tensor(faces, "faces", torch::kInt32);
 
-} // namespace cumesh_xatlas
+    uint32_t vertexCount = static_cast<uint32_t>(vertices.size(0));
+    uint32_t faceCount = static_cast<uint32_t>(faces.size(0));
+
+    std::vector<float> outUvs;
+    std::vector<int32_t> outIndices;
+    std::vector<int32_t> outVmap;
+    int splitCount = 0;
+
+    bool success = cumesh_xatlas::ParameterizeLscm(
+        vertices.data_ptr<float>(),
+        vertexCount,
+        faces.data_ptr<int32_t>(),
+        faceCount,
+        outUvs,
+        outIndices,
+        outVmap,
+        splitCount
+    );
+
+    uint32_t newVertexCount = static_cast<uint32_t>(outVmap.size());
+    auto uvsTensor = torch::empty({(long)newVertexCount, 2}, torch::dtype(torch::kFloat32).device(torch::kCPU));
+    auto facesTensor = torch::empty({(long)outIndices.size() / 3, 3}, torch::dtype(torch::kInt32).device(torch::kCPU));
+    auto vmapTensor = torch::empty({(long)newVertexCount}, torch::dtype(torch::kInt32).device(torch::kCPU));
+
+    memcpy(uvsTensor.data_ptr<float>(), outUvs.data(), sizeof(float) * outUvs.size());
+    memcpy(facesTensor.data_ptr<int32_t>(), outIndices.data(), sizeof(int32_t) * outIndices.size());
+    memcpy(vmapTensor.data_ptr<int32_t>(), outVmap.data(), sizeof(int32_t) * outVmap.size());
+
+    return std::make_tuple(uvsTensor, facesTensor, vmapTensor, success, splitCount);
+}
+
+}
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -180,7 +250,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<cumesh_xatlas::XAtlasWrapper>(m, "Atlas")
         .def(py::init<>())
         .def("add_mesh", &cumesh_xatlas::XAtlasWrapper::AddMesh)
+        .def("add_uv_mesh", &cumesh_xatlas::XAtlasWrapper::AddUvMesh, py::arg("uvs"), py::arg("faces"), py::arg("face_materials") = py::none())
         .def("compute_charts", &cumesh_xatlas::XAtlasWrapper::ComputeCharts)
         .def("pack_charts", &cumesh_xatlas::XAtlasWrapper::PackCharts)
         .def("get_mesh", &cumesh_xatlas::XAtlasWrapper::GetMesh);
+
+    m.def("parameterize_lscm", &cumesh_xatlas::ParameterizeLscmBinding);
 }

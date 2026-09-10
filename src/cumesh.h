@@ -499,6 +499,13 @@ public:
      * - The chart faces offset as an [C+1] tensor.
      */
     std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> read_atlas_charts();
+    int merge_micro_charts(
+        float min_area_ratio,
+        int min_faces,
+        float min_enclosure,
+        int merge_iterations,
+        float max_cone_half_angle_rad
+    );
 };
 
 } // namespace cumesh
