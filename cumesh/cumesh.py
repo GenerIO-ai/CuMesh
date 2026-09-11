@@ -1,170 +1,245 @@
 from typing import *
 import math
+import os
+import warnings
 import torch
 import numpy as np
-import scipy.sparse as sp
-from collections import defaultdict
+from time import perf_counter
 from tqdm import tqdm
-from .xatlas import Atlas, parameterize_lscm
+from .xatlas import Atlas
 from . import _C
 
 
-def _split_edge_connected_components(cv_np, cf_np, cvmap_np):
-    num_f = len(cf_np)
-    if num_f <= 1:
-        return [(cv_np, cf_np, cvmap_np)]
-    edge_to_faces = defaultdict(list)
-    for fi, tri in enumerate(cf_np):
-        for e in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
-            edge_to_faces[tuple(sorted(e))].append(fi)
-
-    parent = list(range(num_f))
-    def find(i):
-        path = []
-        while parent[i] != i:
-            path.append(i)
-            i = parent[i]
-        for node in path:
-            parent[node] = i
-        return i
-    def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
-
-    for flist in edge_to_faces.values():
-        if len(flist) > 1:
-            for f_other in flist[1:]:
-                union(flist[0], f_other)
-
-    comp_map = defaultdict(list)
-    for fi in range(num_f):
-        comp_map[find(fi)].append(fi)
-
-    if len(comp_map) == 1:
-        return [(cv_np, cf_np, cvmap_np)]
-
-    out_pieces = []
-    for flist in comp_map.values():
-        sub_cf = cf_np[flist]
-        u_v, inv_v = np.unique(sub_cf, return_inverse=True)
-        remapped_cf = inv_v.reshape(sub_cf.shape).astype(np.int32)
-        remapped_cv = cv_np[u_v]
-        remapped_vmap = cvmap_np[u_v]
-        out_pieces.append((remapped_cv, remapped_cf, remapped_vmap))
-    return out_pieces
+def _validate_uv_output(atlas, uvs, faces):
+    """Validate actual output coordinates; winding is never a quality signal."""
+    result = atlas._validate_uv(uvs.contiguous(), faces.contiguous())
+    coords = uvs.numpy()
+    result["out_of_range_values"] = int(np.count_nonzero((coords < 0.0) | (coords > 1.0)))
+    if result["valid"] and result["out_of_range_values"]:
+        result["valid"] = False
+        result["issue"] = "out_of_range"
+    return result
 
 
-def _detach_chart_filaments(cv_np, cf_np, cvmap_np, core_depth_thresh=6, min_filament_length=15):
-    edge_to_faces = defaultdict(list)
-    for fi, tri in enumerate(cf_np):
-        for e in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
-            edge_to_faces[tuple(sorted(e))].append(fi)
-    adj = defaultdict(list)
-    bnd_faces = set()
-    internal_edges = []
-    for e, flist in edge_to_faces.items():
-        if len(flist) == 2:
-            adj[flist[0]].append(flist[1])
-            adj[flist[1]].append(flist[0])
-            internal_edges.append((flist[0], flist[1]))
-        elif len(flist) == 1:
-            bnd_faces.add(flist[0])
+def _project_chart_uvs(vertices):
+    """Create a winding-independent planar fallback using PCA."""
+    points = np.asarray(vertices, dtype=np.float64)
+    centered = points - np.mean(points, axis=0, keepdims=True)
+    if len(points) >= 3:
+        try:
+            _, _, basis = np.linalg.svd(centered, full_matrices=False)
+            if basis.shape[0] >= 2:
+                projected = centered @ basis[:2].T
+                if np.isfinite(projected).all() and np.ptp(projected, axis=0).max() > 0:
+                    return projected
+        except np.linalg.LinAlgError:
+            pass
 
-    depth = np.full(len(cf_np), -1, dtype=np.int32)
-    q = list(bnd_faces)
-    for bf in bnd_faces: depth[bf] = 0
-    head = 0
-    while head < len(q):
-        u = q[head]; head += 1
-        d = depth[u]
-        for v in adj[u]:
-            if depth[v] == -1: depth[v] = d + 1; q.append(v)
-
-    core_faces = set(np.where(depth >= core_depth_thresh)[0])
-    if len(core_faces) == 0:
-        return [(cv_np, cf_np, cvmap_np)]
-
-    dist_from_core = np.full(len(cf_np), -1, dtype=np.int32)
-    q_core = list(core_faces)
-    for cf_idx in core_faces: dist_from_core[cf_idx] = 0
-    head = 0
-    while head < len(q_core):
-        u = q_core[head]; head += 1
-        d = dist_from_core[u]
-        for v in adj[u]:
-            if dist_from_core[v] == -1: dist_from_core[v] = d + 1; q_core.append(v)
-
-    is_filament = (dist_from_core >= min_filament_length) & (depth <= 2)
-    if not np.any(is_filament):
-        return [(cv_np, cf_np, cvmap_np)]
-
-    sub_0, sub_1 = [], []
-    for f0, f1 in internal_edges:
-        if is_filament[f0] == is_filament[f1]:
-            sub_0.append(f0); sub_1.append(f1)
-
-    g = sp.csr_matrix((np.ones(len(sub_0)), (sub_0, sub_1)), shape=(len(cf_np), len(cf_np)))
-    n_c, labels = sp.csgraph.connected_components(g, directed=False)
-
-    out_pieces = []
-    for lbl in range(n_c):
-        p_idx = np.where(labels == lbl)[0]
-        if len(p_idx) > 0:
-            sub_cf = cf_np[p_idx]
-            u_v, inv_v = np.unique(sub_cf, return_inverse=True)
-            remapped_cf = inv_v.reshape(sub_cf.shape).astype(np.int32)
-            remapped_cv = cv_np[u_v]
-            remapped_vmap = cvmap_np[u_v]
-            out_pieces.append((remapped_cv, remapped_cf, remapped_vmap))
-    return out_pieces
+    # This is only an emergency path for malformed/zero-span input. It does
+    # not infer or enforce a face winding.
+    indices = np.arange(len(points), dtype=np.float64)
+    return np.column_stack((indices, (indices % 2) * 1e-3))
 
 
-def _split_bending_ribbons(cv_np, cf_np, cvmap_np, max_angle_span_deg=100.0):
-    p0 = cv_np[cf_np[:, 0]]; p1 = cv_np[cf_np[:, 1]]; p2 = cv_np[cf_np[:, 2]]
-    cross_3d = np.cross(p1 - p0, p2 - p0)
-    a3d = 0.5 * np.sum(np.linalg.norm(cross_3d, axis=1))
+def _repair_collapsed_uv_faces(uvs, faces, vmaps=None, threshold=2e-18):
+    """Repair numerically collapsed triangles without using face winding.
 
-    edge_to_faces = defaultdict(list)
-    for fi, tri in enumerate(cf_np):
-        for e in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
-            edge_to_faces[tuple(sorted(e))].append(fi)
-    bnd_e = [e for e, flist in edge_to_faces.items() if len(flist) == 1]
-    if len(bnd_e) == 0:
-        return [(cv_np, cf_np, cvmap_np)]
-    bnd_len = np.sum(np.linalg.norm(cv_np[[e[0] for e in bnd_e]] - cv_np[[e[1] for e in bnd_e]], axis=1))
-    iq = 4 * np.pi * a3d / (bnd_len**2 + 1e-12)
+    A repaired corner receives a duplicate UV vertex. This preserves the
+    source-vertex mapping while allowing the problematic face to be made
+    non-zero without perturbing its neighbours. The operation is normally a
+    no-op and is linear in the number of faces.
+    """
+    uv_np = np.ascontiguousarray(np.asarray(uvs, dtype=np.float32))
+    face_np = np.ascontiguousarray(np.asarray(faces, dtype=np.int32)).copy()
+    vmap_np = None if vmaps is None else np.ascontiguousarray(np.asarray(vmaps, dtype=np.int32))
+    if uv_np.ndim != 2 or uv_np.shape[1] != 2 or face_np.ndim != 2 or face_np.shape[1] != 3:
+        return uv_np, face_np, vmap_np, 0
+    if len(face_np) == 0:
+        return uv_np, face_np, vmap_np, 0
+    if np.any(face_np < 0) or np.any(face_np >= len(uv_np)):
+        return uv_np, face_np, vmap_np, 0
 
-    if iq >= 0.05:
-        return [(cv_np, cf_np, cvmap_np)]
+    p0 = uv_np[face_np[:, 0]].astype(np.float64)
+    p1 = uv_np[face_np[:, 1]].astype(np.float64)
+    p2 = uv_np[face_np[:, 2]].astype(np.float64)
+    cross = (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - \
+        (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
+    bad = ~np.isfinite(cross) | (np.abs(cross) <= threshold)
+    bad_faces = np.flatnonzero(bad)
+    if len(bad_faces) == 0:
+        return uv_np, face_np, vmap_np, 0
 
-    center_xz = np.mean(cv_np[:, [0, 2]], axis=0)
-    angles = np.arctan2(cv_np[:, 2] - center_xz[1], cv_np[:, 0] - center_xz[0])
-    ang_span = np.ptp(angles)
-    if ang_span <= np.radians(max_angle_span_deg):
-        return [(cv_np, cf_np, cvmap_np)]
+    extra_uvs = []
+    extra_vmaps = []
+    repaired = 0
+    for face_index in bad_faces:
+        tri = face_np[face_index].copy()
+        points = uv_np[tri].astype(np.float64)
+        if not np.isfinite(points).all():
+            points = np.nan_to_num(points, nan=0.0, posinf=1.0, neginf=-1.0)
 
-    num_splits = int(np.ceil(ang_span / np.radians(80)))
-    f_centers_xz = np.mean(cv_np[cf_np, :][:, :, [0, 2]], axis=1)
-    f_angles = np.arctan2(f_centers_xz[:, 1] - center_xz[1], f_centers_xz[:, 0] - center_xz[0])
-    f_angles_norm = (f_angles - np.min(angles)) % (2 * np.pi)
-    bin_size = (2 * np.pi) / num_splits
-    face_bins = np.clip((f_angles_norm / bin_size).astype(int), 0, num_splits - 1)
+        edge_pairs = ((0, 1), (1, 2), (2, 0))
+        lengths = [float(np.linalg.norm(points[a] - points[b])) for a, b in edge_pairs]
+        pair_index = int(np.argmax(lengths))
+        a, b = edge_pairs[pair_index]
+        edge = points[b] - points[a]
+        edge_length = lengths[pair_index]
+        delta = max(1e-6, 1e-4 * edge_length)
 
-    out_pieces = []
-    for b in range(num_splits):
-        b_idx = np.where(face_bins == b)[0]
-        if len(b_idx) > 0:
-            sub_cf = cf_np[b_idx]
-            u_v, inv_v = np.unique(sub_cf, return_inverse=True)
-            remapped_cf = inv_v.reshape(sub_cf.shape).astype(np.int32)
-            remapped_cv = cv_np[u_v]
-            remapped_vmap = cvmap_np[u_v]
-            out_pieces.append((remapped_cv, remapped_cf, remapped_vmap))
-    if len(out_pieces) == 0:
-        return [(cv_np, cf_np, cvmap_np)]
-    return out_pieces
+        if edge_length > 0.0 and np.isfinite(edge_length):
+            # The sign is arbitrary; it is not used as a winding signal.
+            perpendicular = np.array([-edge[1], edge[0]], dtype=np.float64) / edge_length
+            replacement = 0.5 * (points[a] + points[b]) + perpendicular * delta
+            corner = 3 - a - b
+            extra_uvs.append(replacement.astype(np.float32))
+            if vmap_np is not None:
+                extra_vmaps.append(vmap_np[tri[corner]])
+            face_np[face_index, corner] = len(uv_np) + len(extra_uvs) - 1
+        else:
+            # All three UVs coincide. Give two private corners a tiny
+            # non-collinear offset.
+            center = np.mean(points, axis=0)
+            first = center + np.array([delta, 0.0])
+            second = center + np.array([0.0, delta])
+            extra_uvs.extend((first.astype(np.float32), second.astype(np.float32)))
+            if vmap_np is not None:
+                extra_vmaps.extend((vmap_np[tri[1]], vmap_np[tri[2]]))
+            face_np[face_index, 1] = len(uv_np) + len(extra_uvs) - 2
+            face_np[face_index, 2] = len(uv_np) + len(extra_uvs) - 1
+        repaired += 1
+
+    if extra_uvs:
+        uv_np = np.concatenate((uv_np, np.asarray(extra_uvs, dtype=np.float32)), axis=0)
+        if vmap_np is not None:
+            vmap_np = np.concatenate((vmap_np, np.asarray(extra_vmaps, dtype=np.int32)))
+    return uv_np, face_np, vmap_np, repaired
+
+
+def _prepare_uv_chart(vertices, faces, uvs, vmaps, area_scale=None):
+    """Condition chart UVs for float32/xatlas and repair zero-area faces."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(np.asarray(faces, dtype=np.int32))
+    vmap_np = np.ascontiguousarray(np.asarray(vmaps, dtype=np.int32))
+    uv_np = np.asarray(uvs, dtype=np.float64)
+    projected = False
+    if uv_np.ndim != 2 or uv_np.shape != (len(vmap_np), 2) or not np.isfinite(uv_np).all():
+        uv_np = _project_chart_uvs(vertices)
+        projected = True
+
+    if area_scale is not None and np.isfinite(area_scale) and area_scale > 0:
+        uv_np *= float(area_scale)
+
+    lower = np.min(uv_np, axis=0)
+    extent = float(np.ptp(uv_np, axis=0).max())
+    if not np.isfinite(lower).all() or not np.isfinite(extent) or extent <= 0:
+        uv_np = _project_chart_uvs(vertices)
+        lower = np.min(uv_np, axis=0)
+        projected = True
+    # Translation preserves both chart geometry and the relative chart area
+    # used by xatlas. Avoiding a second per-chart scale is important: it keeps
+    # the existing texel-density behaviour while still removing large UV
+    # offsets before the float32 conversion.
+    uv_np = uv_np - lower
+    uv_np = np.ascontiguousarray(uv_np.astype(np.float32))
+    uv_np, faces_np, vmap_np, repaired = _repair_collapsed_uv_faces(
+        uv_np, faces_np, vmap_np
+    )
+    return uv_np, faces_np, vmap_np, repaired, projected
+
+
+def _chart_texture_color(chart_index):
+    """Return a deterministic, well-separated RGBA color for one chart."""
+    hue = (0.07 + chart_index * 0.618033988749895) % 1.0
+    h = hue * 6.0
+    sector = min(5, int(h))
+    fraction = h - int(h)
+    q = 1.0 - fraction
+    t = fraction
+    rgb = (
+        (1.0, t, 0.0),
+        (q, 1.0, 0.0),
+        (0.0, 1.0, t),
+        (0.0, q, 1.0),
+        (t, 0.0, 1.0),
+        (1.0, 0.0, q),
+    )[sector]
+    return np.asarray(
+        [round(channel * 255.0) for channel in rgb] + [255],
+        dtype=np.uint8,
+    )
+
+
+def _rasterize_chart_texture(uvs, faces, face_chart_ids, width, height):
+    """Rasterize packed chart IDs into a small CPU RGBA debug texture.
+
+    The texture uses the same normalized UV domain returned by ``Atlas``.
+    Pixels not covered by a packed triangle receive an opaque dark background.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    texture = np.empty((height, width, 4), dtype=np.uint8)
+    texture[:, :] = np.array([24, 24, 24, 255], dtype=np.uint8)
+    chart_colors = {}
+
+    uv_np = np.asarray(uvs, dtype=np.float64)
+    face_np = np.asarray(faces, dtype=np.int64)
+    chart_np = np.asarray(face_chart_ids, dtype=np.int64)
+    if (
+        uv_np.ndim != 2
+        or uv_np.shape[1] != 2
+        or face_np.ndim != 2
+        or face_np.shape[1] != 3
+        or len(face_np) != len(chart_np)
+    ):
+        return torch.from_numpy(texture)
+
+    for triangle, chart_index in zip(face_np, chart_np):
+        if np.any(triangle < 0) or np.any(triangle >= len(uv_np)):
+            continue
+        triangle_uv = uv_np[triangle]
+        if not np.isfinite(triangle_uv).all():
+            continue
+
+        # Trimesh uses a bottom-left UV origin, while image rows start at the
+        # top. Convert V into image-row coordinates before rasterizing.
+        x = triangle_uv[:, 0] * width
+        y = (1.0 - triangle_uv[:, 1]) * height
+        min_x = max(0, int(np.floor(np.min(x))))
+        max_x = min(width - 1, int(np.ceil(np.max(x)) - 1))
+        min_y = max(0, int(np.floor(np.min(y))))
+        max_y = min(height - 1, int(np.ceil(np.max(y)) - 1))
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        pixel_x, pixel_y = np.meshgrid(
+            np.arange(min_x, max_x + 1, dtype=np.float64) + 0.5,
+            np.arange(min_y, max_y + 1, dtype=np.float64) + 0.5,
+        )
+        denominator = (
+            (y[1] - y[2]) * (x[0] - x[2])
+            + (x[2] - x[1]) * (y[0] - y[2])
+        )
+        if abs(denominator) <= 1e-12:
+            continue
+
+        weight_0 = (
+            (y[1] - y[2]) * (pixel_x - x[2])
+            + (x[2] - x[1]) * (pixel_y - y[2])
+        ) / denominator
+        weight_1 = (
+            (y[2] - y[0]) * (pixel_x - x[2])
+            + (x[0] - x[2]) * (pixel_y - y[2])
+        ) / denominator
+        weight_2 = 1.0 - weight_0 - weight_1
+        covered = (weight_0 >= -1e-6) & (weight_1 >= -1e-6) & (weight_2 >= -1e-6)
+        if np.any(covered):
+            chart_index = int(chart_index)
+            if chart_index not in chart_colors:
+                chart_colors[chart_index] = _chart_texture_color(chart_index)
+            color = chart_colors[chart_index]
+            texture[min_y:max_y + 1, min_x:max_x + 1][covered] = color
+
+    return torch.from_numpy(texture)
 
 
 class CuMesh:
@@ -438,6 +513,34 @@ class CuMesh:
                 Note that a face is considered degenerate if both the absolute and relative conditions are met.
         """
         self.cu_mesh.remove_degenerate_faces(abs_thresh, rel_thresh)
+
+    def normalize(
+        self,
+        min_area_abs: float = 1e-24,
+        min_area_rel: float = 1e-12,
+        iterations: int = 1,
+        verbose: bool = False,
+    ):
+        """Split non-manifold edges once and collapse small interior triangles.
+
+        Args:
+            min_area_abs: absolute triangle-area threshold.
+            min_area_rel: triangle-area threshold relative to the square of
+                the triangle's longest edge.
+            iterations: number of GPU small-triangle collapse passes. Stage 1
+                is always performed exactly once.
+            verbose: reserved for native timing/progress diagnostics.
+        """
+        if not isinstance(iterations, int) or iterations < 0:
+            raise ValueError("iterations must be a non-negative integer")
+        if min_area_abs < 0 or min_area_rel < 0:
+            raise ValueError("area thresholds must be non-negative")
+        self.cu_mesh.normalize(
+            float(min_area_abs),
+            float(min_area_rel),
+            iterations,
+            bool(verbose),
+        )
         
     def fill_holes(self, max_hole_perimeter: float=3e-2):
         """
@@ -522,11 +625,11 @@ class CuMesh:
     def compute_charts(
         self,
         threshold_cone_half_angle_rad: float=math.radians(90),
-        refine_iterations: int=100,
+        refine_iterations: int=0,
         global_iterations: int=3,
         smooth_strength: float=1,
-        area_penalty_weight: float=0.1,
-        perimeter_area_ratio_weight: float=0.0001,
+        area_penalty_weight: float=0.0,
+        perimeter_area_ratio_weight: float=0.0,
     ):
         """
         Compute the atlas charts.
@@ -572,184 +675,356 @@ class CuMesh:
 
     def uv_unwrap(
         self,
-        compute_charts_kwargs: dict = {},
-        xatlas_compute_charts_kwargs: dict = {},
-        xatlas_pack_charts_kwargs: dict = {},
+        compute_charts_kwargs: Optional[dict] = None,
+        xatlas_pack_charts_kwargs: Optional[dict] = None,
         return_vmaps: bool = False,
         verbose: bool = False,
-        preserve_cumesh_charts: bool = False,
-        micro_chart_cleanup_kwargs: dict = {},
         return_stats: bool = False,
+        debug_charts: bool = False,
     ):
-        xatlas_compute_charts_kwargs['verbose'] = verbose
-        xatlas_pack_charts_kwargs['verbose'] = verbose
+        """Generate packed UVs directly from CuMesh charts.
 
-        self.remove_degenerate_faces()
-
-        if not preserve_cumesh_charts:
-            self.compute_charts(**compute_charts_kwargs)
-            new_vertices, new_faces = self.read()
-            num_charts, charts_id, chart_vmap, chart_faces, chart_vertex_offset, chart_face_offset = self.read_atlas_charts()
-            chart_vertices = new_vertices[chart_vmap].cpu()
-            chart_faces = chart_faces.cpu()
-            chart_vertex_offset = chart_vertex_offset.cpu()
-            chart_face_offset = chart_face_offset.cpu()
-            chart_vmap = chart_vmap.cpu()
-            if verbose:
-                print(f"Get {num_charts} clusters after fast clustering")
-
-            xatlas = Atlas()
-            chart_vmaps = []
-            for i in tqdm(range(num_charts), desc="Adding clusters to xatlas", disable=not verbose):
-                chart_faces_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]] - chart_vertex_offset[i]
-                chart_vertices_i = chart_vertices[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-                chart_vmap_i = chart_vmap[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-                chart_vmaps.append(chart_vmap_i)
-                xatlas.add_mesh(chart_vertices_i, chart_faces_i)
-            xatlas.compute_charts(**xatlas_compute_charts_kwargs)
-            xatlas.pack_charts(**xatlas_pack_charts_kwargs)
-            vmaps = []
-            faces = []
-            uvs = []
-            cnt = 0
-            for i in tqdm(range(num_charts), desc="Gathering results from xatlas", disable=not verbose):
-                vmap, x_faces, x_uvs = xatlas.get_mesh(i)
-                vmaps.append(chart_vmaps[i][vmap])
-                faces.append(x_faces + cnt)
-                uvs.append(x_uvs)
-                cnt += vmap.shape[0]
-            vmaps = torch.cat(vmaps, dim=0)
-            vertices = new_vertices.cpu()[vmaps]
-            faces = torch.cat(faces, dim=0)
-            uvs = torch.cat(uvs, dim=0)
-
-            out = [vertices, faces, uvs]
-            if return_vmaps:
-                out.append(vmaps)
-            if return_stats:
-                out.append({})
-            return tuple(out)
-
-
-        compute_kwargs = dict(compute_charts_kwargs)
+        The pipeline normalizes the mesh, computes CuMesh charts, parameterizes
+        each chart with native LSCM, adds the parameterized charts to xatlas,
+        packs them, and returns the packed mesh. When debug_charts is true,
+        the return value also contains an RGBA texture colored by chart.
+        """
+        compute_kwargs = dict(compute_charts_kwargs or {})
         compute_kwargs.setdefault("refine_iterations", 0)
         compute_kwargs.setdefault("area_penalty_weight", 0.0)
-        compute_kwargs.setdefault("perimeter_area_ratio_weight", 0.0005)
+        compute_kwargs.setdefault("perimeter_area_ratio_weight", 0.0)
 
+        pack_opts = dict(xatlas_pack_charts_kwargs or {})
+        pack_opts.setdefault("padding", 4)
+        pack_opts.setdefault("verbose", verbose)
+
+        def log_completed(name: str, started_at: float, details: str = ""):
+            if verbose:
+                suffix = f" ({details})" if details else ""
+                print(
+                    f"CuMesh UV Unwrap: {name}: "
+                    f"completed in {perf_counter() - started_at:.3f}s{suffix}",
+                    flush=True,
+                )
+
+        trace_lscm_enabled = verbose and os.environ.get("CUMESH_UV_TRACE", "").lower() in {
+            "1", "true", "yes", "on"
+        }
+
+        phase_started = perf_counter()
+        self.normalize(verbose=verbose)
+        log_completed(
+            "normalize",
+            phase_started,
+            f"vertices={self.num_vertices}, faces={self.num_faces}",
+        )
+
+        phase_started = perf_counter()
         self.compute_charts(**compute_kwargs)
-        initial_num_charts, _, _, _, _, _ = self.read_atlas_charts()
+        log_completed("compute_charts", phase_started)
 
+        phase_started = perf_counter()
         new_vertices, new_faces = self.read()
-        cleanup_kwargs = dict(micro_chart_cleanup_kwargs)
-        total_mesh_faces = int(new_faces.shape[0])
-        cleanup_kwargs.setdefault("min_faces", min(128, max(4, int(total_mesh_faces * 0.005))))
-        merges = self.merge_micro_charts(**cleanup_kwargs)
+        (
+            num_charts,
+            _,
+            chart_vmap,
+            chart_faces,
+            chart_vertex_offset,
+            chart_face_offset,
+        ) = self.read_atlas_charts()
+        log_completed(
+            "read chart data",
+            phase_started,
+            f"charts={num_charts}, vertices={new_vertices.shape[0]}, "
+            f"faces={new_faces.shape[0]}",
+        )
 
-        new_vertices, new_faces = self.read()
-        num_charts, charts_id, chart_vmap, chart_faces, chart_vertex_offset, chart_face_offset = self.read_atlas_charts()
+        if num_charts == 0:
+            vertices = new_vertices.new_empty((0, 3)).cpu()
+            faces = torch.empty((0, 3), dtype=torch.int32)
+            uvs = torch.empty((0, 2), dtype=torch.float32)
+            out = [vertices, faces, uvs]
+            if debug_charts:
+                chart_texture = torch.tensor(
+                    [24, 24, 24, 255], dtype=torch.uint8
+                ).reshape(1, 1, 4)
+                out.append(chart_texture)
+            if return_vmaps:
+                out.append(torch.empty((0,), dtype=torch.int32))
+            if return_stats:
+                out.append({
+                    "chart_count": 0,
+                    "debug_charts": bool(debug_charts),
+                    "uv_validation_passed": True,
+                })
+            return tuple(out)
 
-        chart_vertices = new_vertices[chart_vmap].cpu().numpy()
+        phase_started = perf_counter()
+        chart_vertices = new_vertices[chart_vmap.long()].cpu().numpy()
         chart_faces = chart_faces.cpu().numpy()
-        chart_vertex_offset = chart_vertex_offset.cpu().numpy()
-        chart_face_offset = chart_face_offset.cpu().numpy()
+        chart_vertex_offset = chart_vertex_offset.cpu().tolist()
+        chart_face_offset = chart_face_offset.cpu().tolist()
         chart_vmap = chart_vmap.cpu().numpy()
 
-        final_charts = []
-        for i in range(num_charts):
-            cf_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]] - chart_vertex_offset[i]
-            cv_i = chart_vertices[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-            cvmap_i = chart_vmap[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-            for p1 in _split_edge_connected_components(cv_i, cf_i, cvmap_i):
-                for p2 in _detach_chart_filaments(*p1):
-                    for p3 in _split_bending_ribbons(*p2):
-                        for p4 in _split_edge_connected_components(*p3):
-                            final_charts.append(p4)
+        charts = []
+        for chart_index in range(num_charts):
+            vertex_start = chart_vertex_offset[chart_index]
+            vertex_end = chart_vertex_offset[chart_index + 1]
+            face_start = chart_face_offset[chart_index]
+            face_end = chart_face_offset[chart_index + 1]
+            charts.append((
+                np.ascontiguousarray(
+                    chart_vertices[vertex_start:vertex_end], dtype=np.float32
+                ),
+                np.ascontiguousarray(
+                    chart_faces[face_start:face_end] - vertex_start,
+                    dtype=np.int32,
+                ),
+                np.ascontiguousarray(
+                    chart_vmap[vertex_start:vertex_end], dtype=np.int32
+                ),
+            ))
+        log_completed(
+            "copy chart data to CPU",
+            phase_started,
+            f"charts={num_charts}",
+        )
 
-        xatlas = Atlas()
-        lscm_failures = 0
-        local_splits = 0
+        atlas = Atlas()
+        packed_vertices = np.ascontiguousarray(
+            np.concatenate([chart[0] for chart in charts], axis=0),
+            dtype=np.float32,
+        )
+        packed_faces = np.ascontiguousarray(
+            np.concatenate([chart[1] for chart in charts], axis=0),
+            dtype=np.int32,
+        )
+        vertex_offsets = [0]
+        face_offsets = [0]
+        for chart_vertices_i, chart_faces_i, _ in charts:
+            vertex_offsets.append(vertex_offsets[-1] + len(chart_vertices_i))
+            face_offsets.append(face_offsets[-1] + len(chart_faces_i))
+
+        lscm_progress = tqdm(
+            total=num_charts,
+            desc="LSCM parameterizing charts",
+            disable=not verbose,
+        )
+
+        def update_lscm_progress(completed, total):
+            if completed > lscm_progress.n:
+                lscm_progress.n = completed
+                lscm_progress.refresh()
+            return True
+
+        def trace_lscm(chart_index, phase, vertex_count, face_count):
+            print(
+                f"CuMesh UV Trace: LSCM chart {chart_index + 1}/{num_charts}: "
+                f"{phase} (vertices={vertex_count}, faces={face_count})",
+                flush=True,
+            )
+
+        phase_started = perf_counter()
+        try:
+            (
+                batch_uvs,
+                batch_faces,
+                batch_vmaps,
+                batch_vertex_offsets,
+                batch_face_offsets,
+                batch_success,
+                batch_splits,
+            ) = atlas._parameterize_lscm_batch(
+                torch.from_numpy(packed_vertices),
+                torch.from_numpy(packed_faces),
+                torch.tensor(vertex_offsets, dtype=torch.int32),
+                torch.tensor(face_offsets, dtype=torch.int32),
+                update_lscm_progress if verbose else None,
+                trace_lscm if trace_lscm_enabled else None,
+            )
+        finally:
+            lscm_progress.close()
+        parameterization_seconds = perf_counter() - phase_started
+        native_stats = atlas._lscm_stats()
+
+        batch_vertex_offsets = batch_vertex_offsets.tolist()
+        batch_face_offsets = batch_face_offsets.tolist()
+        batch_success = batch_success.tolist()
+        batch_splits = batch_splits.tolist()
         chart_vmaps = []
+        python_fallback_charts = 0
+        geometry_repairs = 0
+        local_splits = 0
 
-        for i, (cv_np, cf_np, cvmap_np) in enumerate(tqdm(final_charts, desc="LSCM parameterizing charts", disable=not verbose)):
-            cv_t = torch.from_numpy(cv_np).float()
-            cf_t = torch.from_numpy(cf_np).int()
+        phase_started = perf_counter()
+        for chart_index, (chart_vertices_i, chart_faces_i, chart_vmap_i) in enumerate(charts):
+            p0 = chart_vertices_i[chart_faces_i[:, 0]]
+            p1 = chart_vertices_i[chart_faces_i[:, 1]]
+            p2 = chart_vertices_i[chart_faces_i[:, 2]]
+            area_3d = 0.5 * np.sum(
+                np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+            )
 
-            p0 = cv_np[cf_np[:, 0]]; p1 = cv_np[cf_np[:, 1]]; p2 = cv_np[cf_np[:, 2]]
-            a3d = 0.5 * np.sum(np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1))
+            vertex_start = batch_vertex_offsets[chart_index]
+            vertex_end = batch_vertex_offsets[chart_index + 1]
+            face_start = batch_face_offsets[chart_index]
+            face_end = batch_face_offsets[chart_index + 1]
+            uvs_source = batch_uvs[vertex_start:vertex_end]
+            faces_source = batch_faces[face_start:face_end]
+            local_vmap_source = batch_vmaps[vertex_start:vertex_end]
+            success_i = bool(batch_success[chart_index])
 
-            uvs_i, faces_i, local_vmap_i, success_i, splits_i = parameterize_lscm(cv_t, cf_t)
-            if not success_i or len(faces_i) == 0:
-                lscm_failures += 1
-                cross_3d = np.cross(p1 - p0, p2 - p0)
-                norm = np.sum(cross_3d, axis=0)
-                norm_len = np.linalg.norm(norm)
-                if norm_len > 1e-8:
-                    norm = norm / norm_len
-                else:
-                    norm = np.array([0.0, 0.0, 1.0])
-                up = np.array([0.0, 1.0, 0.0]) if abs(norm[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
-                tangent = np.cross(norm, up)
-                tangent = tangent / (np.linalg.norm(tangent) + 1e-8)
-                bitangent = np.cross(norm, tangent)
-                u_proj = np.dot(cv_np, tangent)
-                v_proj = np.dot(cv_np, bitangent)
-                uvs_i = torch.from_numpy(np.stack([u_proj, v_proj], axis=1)).float()
-                faces_i = torch.from_numpy(cf_np).int()
-                local_vmap_i = torch.arange(len(cv_np), dtype=torch.int32)
+            if (
+                not success_i
+                or len(faces_source) != len(chart_faces_i)
+                or len(uvs_source) != len(local_vmap_source)
+            ):
+                python_fallback_charts += 1
+                uvs_source = _project_chart_uvs(chart_vertices_i)
+                faces_source = chart_faces_i
+                local_vmap_np = np.arange(len(chart_vertices_i), dtype=np.int32)
             else:
-                local_splits += splits_i
+                local_splits += int(batch_splits[chart_index])
+                uvs_source = uvs_source.numpy()
+                faces_source = faces_source.numpy()
+                local_vmap_np = local_vmap_source.numpy()
 
-            u0 = uvs_i[faces_i[:, 0]].numpy()
-            u1 = uvs_i[faces_i[:, 1]].numpy()
-            u2 = uvs_i[faces_i[:, 2]].numpy()
-            cross = (u1[:, 0] - u0[:, 0]) * (u2[:, 1] - u0[:, 1]) - (u1[:, 1] - u0[:, 1]) * (u2[:, 0] - u0[:, 0])
-            auv = 0.5 * np.sum(np.abs(cross))
+            uv_source_np = np.asarray(uvs_source, dtype=np.float64)
+            u0 = uv_source_np[faces_source[:, 0]]
+            u1 = uv_source_np[faces_source[:, 1]]
+            u2 = uv_source_np[faces_source[:, 2]]
+            cross = (
+                (u1[:, 0] - u0[:, 0]) * (u2[:, 1] - u0[:, 1])
+                - (u1[:, 1] - u0[:, 1]) * (u2[:, 0] - u0[:, 0])
+            )
+            area_uv = 0.5 * np.sum(np.abs(cross))
+            area_scale = None
+            if area_uv > 1e-12 and np.isfinite(area_3d) and area_3d > 0:
+                area_scale = np.sqrt(area_3d / area_uv)
 
-            if auv > 1e-12:
-                scale = np.sqrt(a3d / auv)
-                uvs_i = uvs_i * scale
+            uv_np, face_np, local_vmap_np, repaired, projected = _prepare_uv_chart(
+                chart_vertices_i,
+                faces_source,
+                uvs_source,
+                local_vmap_np,
+                area_scale,
+            )
+            geometry_repairs += repaired
+            if projected and success_i:
+                python_fallback_charts += 1
 
-            orig_vmap_i = torch.from_numpy(cvmap_np[local_vmap_i.long().numpy()])
+            uvs_i = torch.from_numpy(uv_np)
+            faces_i = torch.from_numpy(face_np)
+            orig_vmap_i = torch.from_numpy(chart_vmap_i[local_vmap_np])
             chart_vmaps.append(orig_vmap_i)
-            xatlas.add_uv_mesh(uvs_i, faces_i)
+            atlas.add_uv_mesh(uvs_i, faces_i)
 
-        pack_opts = dict(xatlas_pack_charts_kwargs)
-        pack_opts.setdefault("padding", 4)
-        xatlas.pack_charts(**pack_opts)
+        log_completed(
+            "parameterize charts and add UV meshes",
+            phase_started,
+            f"fallbacks={python_fallback_charts}, repairs={geometry_repairs}",
+        )
 
+        packing_started = perf_counter()
+        atlas.pack_charts(**pack_opts)
+        atlas_info = atlas._atlas_info()
+        packing_seconds = perf_counter() - packing_started
+        log_completed(
+            "pack charts",
+            packing_started,
+            f"atlases={atlas_info['atlas_count']}, "
+            f"size={atlas_info['width']}x{atlas_info['height']}",
+        )
+
+        pages = max(1, int(atlas_info["atlas_count"]))
+        columns = int(np.ceil(np.sqrt(pages)))
+        rows = (pages + columns - 1) // columns
         vmaps = []
         faces = []
         uvs = []
-        cnt = 0
-        for i in range(len(final_charts)):
-            vmap_pk, x_faces, x_uvs = xatlas.get_mesh(i)
-            vmaps.append(chart_vmaps[i][vmap_pk.long()])
-            faces.append(x_faces + cnt)
-            uvs.append(x_uvs)
-            cnt += vmap_pk.shape[0]
+        face_chart_ids = [] if debug_charts else None
+        vertex_count = 0
+        invalid_pages = False
 
-        vmaps = torch.cat(vmaps, dim=0)
-        vertices = new_vertices.cpu()[vmaps]
-        faces = torch.cat(faces, dim=0)
-        uvs = torch.cat(uvs, dim=0)
+        phase_started = perf_counter()
+        for chart_index in range(num_charts):
+            mapping, chart_faces_i, chart_uvs_i = atlas.get_mesh(chart_index)
+            page_ids = atlas._mesh_atlas_indices(chart_index).numpy()
+            invalid_pages |= bool(np.any((page_ids < 0) | (page_ids >= pages)))
+            if pages > 1:
+                tiled = chart_uvs_i.numpy().astype(np.float64)
+                tiled[:, 0] = (tiled[:, 0] + page_ids % columns) / columns
+                tiled[:, 1] = (tiled[:, 1] + page_ids // columns) / rows
+                chart_uvs_i = torch.from_numpy(tiled.astype(np.float32))
 
+            vmaps.append(chart_vmaps[chart_index][mapping.long()])
+            faces.append(chart_faces_i + vertex_count)
+            uvs.append(chart_uvs_i)
+            if debug_charts:
+                face_chart_ids.append(
+                    torch.full(
+                        (chart_faces_i.shape[0],),
+                        chart_index,
+                        dtype=torch.int32,
+                    )
+                )
+            vertex_count += mapping.shape[0]
+
+        vmaps = torch.cat(vmaps, dim=0).contiguous()
+        faces = torch.cat(faces, dim=0).contiguous()
+        uvs = torch.cat(uvs, dim=0).contiguous()
+        if debug_charts:
+            face_chart_ids = torch.cat(face_chart_ids, dim=0).contiguous()
+        log_completed(
+            "gather packed mesh",
+            phase_started,
+            f"vertices={vmaps.shape[0]}, faces={faces.shape[0]}",
+        )
+
+        validation = _validate_uv_output(atlas, uvs, faces)
+        if invalid_pages:
+            validation.update(valid=False, issue="unassigned_atlas_vertices")
+        if not validation["valid"]:
+            warnings.warn(
+                "CuMesh UV Unwrap produced UVs that did not pass validation "
+                f"({validation.get('issue', 'unknown')}).",
+                RuntimeWarning,
+            )
+
+        chart_texture = None
+        if debug_charts:
+            texture_width = max(1, int(atlas_info["width"])) * columns
+            texture_height = max(1, int(atlas_info["height"])) * rows
+            chart_texture = _rasterize_chart_texture(
+                uvs,
+                faces,
+                face_chart_ids,
+                texture_width,
+                texture_height,
+            )
+
+        vertices = new_vertices.cpu()[vmaps.long()]
         stats = {
-            "initial_chart_count": initial_num_charts,
-            "after_cleanup_chart_count": num_charts,
-            "merges": merges,
-            "lscm_failures": lscm_failures,
+            "chart_count": num_charts,
+            "debug_charts": bool(debug_charts),
             "local_splits": local_splits,
-            "final_island_count": len(final_charts),
+            "python_fallback_charts": python_fallback_charts,
+            "geometry_repairs": geometry_repairs,
+            "parameterization_seconds": parameterization_seconds,
+            "packing_seconds": packing_seconds,
+            "xatlas_atlas_count": atlas_info["atlas_count"],
+            "uv_validation_passed": bool(validation["valid"]),
+            **native_stats,
         }
 
-        if verbose:
-            print(f"CuMesh UV Unwrap Preserved: Initial={initial_num_charts}, AfterCleanup={num_charts}, Merges={merges}, LSCM Failures={lscm_failures}, Splits={local_splits}, FinalIslands={len(final_charts)}")
-
         out = [vertices, faces, uvs]
+        if debug_charts:
+            out.append(chart_texture)
         if return_vmaps:
             out.append(vmaps)
         if return_stats:
             out.append(stats)
-
         return tuple(out)
+
 

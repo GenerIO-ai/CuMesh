@@ -34,12 +34,15 @@ MIT License
 Copyright (c) 2012 Brandon Pelfrey
 */
 #include "xatlas.h"
+#include "safe_uv.h"
+#include <exception>
 #ifndef XATLAS_C_API
 #define XATLAS_C_API 0
 #endif
 #if XATLAS_C_API
 #include "xatlas_c.h"
 #endif
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -6489,12 +6492,25 @@ static bool setup_abf_relations(opennl::NLContext *context, int id0, int id1, in
 	return true;
 }
 
-static bool computeLeastSquaresConformalMap(Mesh *mesh)
+static bool computeLeastSquaresConformalMap(
+	Mesh *mesh,
+	LscmTraceFunc traceFunc = nullptr,
+	uint32_t traceChartIndex = UINT32_MAX,
+	void *traceUserData = nullptr
+)
 {
+	const auto trace = [&](const char *phase) {
+		if (traceFunc)
+			traceFunc(traceChartIndex, phase, mesh->vertexCount(), mesh->faceCount(), traceUserData);
+	};
+
+	trace("find_pins_start");
 	uint32_t lockedVertex0, lockedVertex1;
 	if (!findApproximateDiameterVertices(mesh, &lockedVertex0, &lockedVertex1)) {
+		trace("find_pins_failed");
 		return false;
 	}
+	trace("find_pins_end");
 	const float pinDist = length(mesh->position(lockedVertex1) - mesh->position(lockedVertex0));
 	const uint32_t vertexCount = mesh->vertexCount();
 	opennl::NLContext *context = opennl::nlNewContext();
@@ -6515,6 +6531,7 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 			opennl::nlLockVariable(context, 2 * i + 1);
 		}
 	}
+	trace("nl_assembly_start");
 	opennl::nlBegin(context, NL_MATRIX);
 	const uint32_t faceCount = mesh->faceCount();
 	ConstArrayView<Vector3> positions = mesh->positions();
@@ -6555,10 +6572,14 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 	}
 	opennl::nlEnd(context, NL_MATRIX);
 	opennl::nlEnd(context, NL_SYSTEM);
-	if (!opennl::nlSolve(context)) {
+	trace("nl_assembly_end");
+	trace("nl_solve_start");
+	if (!opennl::nlSolve(context) || !std::isfinite(context->error) || context->error > context->threshold) {
+		trace("nl_solve_failed");
 		opennl::nlDeleteContext(context);
 		return false;
 	}
+	trace("nl_solve_end");
 	for (uint32_t i = 0; i < vertexCount; i++) {
 		const double u = opennl::nlGetVariable(context, 2 * i);
 		const double v = opennl::nlGetVariable(context, 2 * i + 1);
@@ -6574,255 +6595,89 @@ static bool computeLeastSquaresConformalMap(Mesh *mesh)
 
 
 bool ParameterizeLscmImpl(
-	const float *positions,
-	uint32_t vertexCount,
-	const int32_t *indices,
-	uint32_t faceCount,
-	std::vector<float> &outUvs,
-	std::vector<int32_t> &outIndices,
-	std::vector<int32_t> &outVmap,
-	int &splitCount
-)
+    const float *positions, uint32_t vertexCount, const int32_t *indices, uint32_t faceCount,
+    std::vector<float> &outUvs, std::vector<int32_t> &outIndices,
+    std::vector<int32_t> &outVmap, int &splitCount,
+    LscmTraceFunc traceFunc = nullptr, uint32_t traceChartIndex = UINT32_MAX,
+    void *traceUserData = nullptr, LscmChartResult *diagnostics = nullptr)
 {
-	splitCount = 0;
-	if (vertexCount < 3 || faceCount == 0) {
-		return false;
-	}
+    LscmChartResult localStats;
+    LscmChartResult &stats = diagnostics ? *diagnostics : localStats;
+    splitCount = 0;
+    outUvs.clear(); outIndices.clear(); outVmap.clear();
+    if (vertexCount < 3 || faceCount == 0) return false;
+    for (size_t i=0;i<size_t(vertexCount)*3;++i) if(!std::isfinite(positions[i]))return false;
+    for (size_t i=0;i<size_t(faceCount)*3;++i)
+        if(indices[i]<0 || uint32_t(indices[i])>=vertexCount)return false;
+    for(uint32_t f=0;f<faceCount;++f)
+        if(indices[3*f]==indices[3*f+1] || indices[3*f]==indices[3*f+2] || indices[3*f+1]==indices[3*f+2])
+            return false;
 
-	std::vector<Vector3> curPositions(vertexCount);
-	std::vector<int32_t> curVmap(vertexCount);
-	for (uint32_t i = 0; i < vertexCount; i++) {
-		curPositions[i] = Vector3(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2]);
-		curVmap[i] = (int32_t)i;
-	}
+    std::vector<int32_t> original(indices,indices+size_t(faceCount)*3);
+    std::vector<int32_t> ordered=original;
+    safeuv::Topology topology(original,int(vertexCount));
+    std::vector<int> flips;
+    bool coherent=topology.orderFaces(ordered,flips);
+    bool hasBoundary=false;
+    for(const auto &b:topology.boundary)if(!b.empty()){hasBoundary=true;break;}
+    auto trace=[&](const char *phase) {
+        if(traceFunc)traceFunc(traceChartIndex,phase,vertexCount,faceCount,traceUserData);
+    };
+    // LSCM uses a locally consistent working copy only. Validation and output
+    // always use the caller's corner order, including arbitrary face reversals.
+    if(coherent && hasBoundary) {
+        trace("lscm_solve_start");
+        auto start=safeuv::Clock::now();
+        Mesh mesh(0.0f,vertexCount,faceCount);
+        for(uint32_t v=0;v<vertexCount;++v)
+            mesh.addVertex(Vector3(positions[v*3],positions[v*3+1],positions[v*3+2]));
+        for(uint32_t f=0;f<faceCount;++f) {
+            uint32_t tri[3]={uint32_t(ordered[f*3]),uint32_t(ordered[f*3+1]),uint32_t(ordered[f*3+2])};
+            mesh.addFace(tri);
+        }
+        mesh.createColocals(); mesh.createBoundaries();
+        Vector3 normal(0.0f);
+        for(uint32_t f=0;f<faceCount;++f)
+            normal+=cross(mesh.position(ordered[f*3+1])-mesh.position(ordered[f*3]),
+                          mesh.position(ordered[f*3+2])-mesh.position(ordered[f*3]));
+        normal=dot(normal,normal)>1e-12f?normalize(normal):Vector3(0,0,1);
+        Vector3 tangent=Basis::computeTangent(normal);
+        Vector3 bitangent=Basis::computeBitangent(normal,tangent);
+        for(uint32_t v=0;v<vertexCount;++v)
+            mesh.texcoord(v)=Vector2(dot(tangent,mesh.position(v)),dot(bitangent,mesh.position(v)));
+        bool solved=computeLeastSquaresConformalMap(&mesh,traceFunc,traceChartIndex,traceUserData);
+        stats.solveSeconds=safeuv::seconds(start);
+        if(solved) {
+            outUvs.resize(size_t(vertexCount)*2);
+            for(uint32_t v=0;v<vertexCount;++v) {
+                outUvs[v*2]=mesh.texcoord(v).x; outUvs[v*2+1]=mesh.texcoord(v).y;
+            }
+            trace("uv_validation");
+            stats.invalidIssue=safeuv::validate(outUvs,original,stats).issue;
+            if(!stats.invalidIssue) {
+                outIndices=original; outVmap.resize(vertexCount);
+                std::iota(outVmap.begin(),outVmap.end(),0);
+                trace("lscm_valid"); return true;
+            }
+        } else stats.invalidIssue=5; // numerical solve/convergence failure
+    } else stats.invalidIssue=6; // topology requires graph recovery
 
-	std::vector<uint32_t> curIndices(faceCount * 3);
-	for (uint32_t i = 0; i < faceCount * 3; i++) {
-		curIndices[i] = (uint32_t)indices[i];
-	}
-
-	for (int retry = 0; retry < 4; retry++) {
-		uint32_t curVCount = (uint32_t)curPositions.size();
-		uint32_t curFCount = (uint32_t)(curIndices.size() / 3);
-		Mesh mesh(0.0f, curVCount, curFCount);
-		for (uint32_t i = 0; i < curVCount; i++) {
-			mesh.addVertex(curPositions[i]);
-		}
-		for (uint32_t f = 0; f < curFCount; f++) {
-			mesh.addFace(&curIndices[f * 3]);
-		}
-		mesh.createColocals();
-		mesh.createBoundaries();
-
-		if (mesh.boundaryEdges().isEmpty()) {
-			uint32_t vA = 0, vB = 0;
-			float maxDistSq = -1.0f;
-			for (uint32_t i = 0; i < curVCount; i++) {
-				for (uint32_t j = i + 1; j < curVCount; j++) {
-					Vector3 diff = curPositions[i] - curPositions[j];
-					float dsq = dot(diff, diff);
-					if (dsq > maxDistSq) {
-						maxDistSq = dsq;
-						vA = i;
-						vB = j;
-					}
-				}
-			}
-
-			std::vector<std::vector<uint32_t>> adj(curVCount);
-			for (uint32_t f = 0; f < curFCount; f++) {
-				uint32_t i0 = curIndices[f * 3 + 0];
-				uint32_t i1 = curIndices[f * 3 + 1];
-				uint32_t i2 = curIndices[f * 3 + 2];
-				adj[i0].push_back(i1); adj[i0].push_back(i2);
-				adj[i1].push_back(i0); adj[i1].push_back(i2);
-				adj[i2].push_back(i0); adj[i2].push_back(i1);
-			}
-
-			std::vector<int> prev(curVCount, -1);
-			std::vector<uint32_t> q;
-			q.push_back(vA);
-			prev[vA] = (int)vA;
-			uint32_t head = 0;
-			while (head < q.size()) {
-				uint32_t u = q[head++];
-				if (u == vB) break;
-				for (uint32_t nxt : adj[u]) {
-					if (prev[nxt] == -1) {
-						prev[nxt] = (int)u;
-						q.push_back(nxt);
-					}
-				}
-			}
-
-			std::vector<uint32_t> path;
-			int curr = (int)vB;
-			while (curr != -1 && (uint32_t)curr != vA) {
-				path.push_back((uint32_t)curr);
-				curr = prev[curr];
-			}
-			path.push_back(vA);
-
-			for (size_t pi = 0; pi + 1 < path.size(); pi++) {
-				uint32_t u = path[pi];
-				uint32_t v = path[pi + 1];
-				uint32_t newV = (uint32_t)curPositions.size();
-				curPositions.push_back(curPositions[v]);
-				curVmap.push_back(curVmap[v]);
-				for (uint32_t f = 0; f < curFCount; f++) {
-					uint32_t i0 = curIndices[f * 3 + 0];
-					uint32_t i1 = curIndices[f * 3 + 1];
-					uint32_t i2 = curIndices[f * 3 + 2];
-					if ((i0 == u && i1 == v) || (i1 == u && i2 == v) || (i2 == u && i0 == v)) {
-						if (curIndices[f * 3 + 0] == v) curIndices[f * 3 + 0] = newV;
-						if (curIndices[f * 3 + 1] == v) curIndices[f * 3 + 1] = newV;
-						if (curIndices[f * 3 + 2] == v) curIndices[f * 3 + 2] = newV;
-						break;
-					}
-				}
-			}
-			splitCount++;
-			continue;
-		}
-
-		Vector3 normal(0.0f);
-		for (uint32_t f = 0; f < curFCount; f++) {
-			Vector3 p0 = mesh.position(mesh.vertexAt(f * 3 + 0));
-			Vector3 p1 = mesh.position(mesh.vertexAt(f * 3 + 1));
-			Vector3 p2 = mesh.position(mesh.vertexAt(f * 3 + 2));
-			normal += cross(p1 - p0, p2 - p0);
-		}
-		if (dot(normal, normal) > 1e-12f) {
-			normal = normalize(normal);
-		} else {
-			normal = Vector3(0, 0, 1);
-		}
-		Basis basis;
-		basis.normal = normal;
-		basis.tangent = Basis::computeTangent(normal);
-		basis.bitangent = Basis::computeBitangent(normal, basis.tangent);
-		for (uint32_t i = 0; i < curVCount; i++) {
-			mesh.texcoord(i) = Vector2(dot(basis.tangent, mesh.position(i)), dot(basis.bitangent, mesh.position(i)));
-		}
-
-		bool solved = computeLeastSquaresConformalMap(&mesh);
-		if (!solved && retry < 3) {
-			splitCount++;
-			continue;
-		}
-
-		float totalParametricArea = 0.0f;
-		for (uint32_t f = 0; f < curFCount; f++) {
-			totalParametricArea += mesh.computeFaceParametricArea(f);
-		}
-		if (totalParametricArea < 0.0f) {
-			for (uint32_t v = 0; v < curVCount; v++) {
-				mesh.texcoord(v).x *= -1.0f;
-			}
-		}
-
-		int flippedCount = 0;
-		int worstFlippedFace = -1;
-		float worstFlippedArea = 0.0f;
-		for (uint32_t f = 0; f < curFCount; f++) {
-			float fa = mesh.computeFaceParametricArea(f);
-			if (fa <= 0.0f) {
-				flippedCount++;
-				if (fa < worstFlippedArea) {
-					worstFlippedArea = fa;
-					worstFlippedFace = (int)f;
-				}
-			}
-		}
-
-		if (flippedCount == 0 || retry == 3 || worstFlippedFace < 0) {
-			outUvs.resize(curVCount * 2);
-			for (uint32_t v = 0; v < curVCount; v++) {
-				outUvs[v * 2 + 0] = mesh.texcoord(v).x;
-				outUvs[v * 2 + 1] = mesh.texcoord(v).y;
-			}
-			outIndices.resize(curIndices.size());
-			for (size_t i = 0; i < curIndices.size(); i++) {
-				outIndices[i] = (int32_t)curIndices[i];
-			}
-			outVmap = curVmap;
-			return solved;
-		}
-
-		uint32_t targetV = curIndices[worstFlippedFace * 3 + 0];
-		uint32_t closestBoundaryV = targetV;
-		float minBndDistSq = 1e30f;
-		for (uint32_t v = 0; v < curVCount; v++) {
-			if (mesh.isBoundaryVertex(v)) {
-				Vector3 d = curPositions[v] - curPositions[targetV];
-				float dsq = dot(d, d);
-				if (dsq < minBndDistSq) {
-					minBndDistSq = dsq;
-					closestBoundaryV = v;
-				}
-			}
-		}
-
-		std::vector<std::vector<uint32_t>> adj(curVCount);
-		for (uint32_t f = 0; f < curFCount; f++) {
-			uint32_t i0 = curIndices[f * 3 + 0];
-			uint32_t i1 = curIndices[f * 3 + 1];
-			uint32_t i2 = curIndices[f * 3 + 2];
-			adj[i0].push_back(i1); adj[i0].push_back(i2);
-			adj[i1].push_back(i0); adj[i1].push_back(i2);
-			adj[i2].push_back(i0); adj[i2].push_back(i1);
-		}
-
-		std::vector<int> prev(curVCount, -1);
-		std::vector<bool> visited(curVCount, false);
-		std::vector<uint32_t> queue;
-		queue.push_back(closestBoundaryV);
-		visited[closestBoundaryV] = true;
-		size_t head = 0;
-		while (head < queue.size()) {
-			uint32_t u = queue[head++];
-			if (u == targetV) break;
-			for (uint32_t nxt : adj[u]) {
-				if (!visited[nxt]) {
-					visited[nxt] = true;
-					prev[nxt] = (int)u;
-					queue.push_back(nxt);
-				}
-			}
-		}
-
-		std::vector<uint32_t> path;
-		int curr = (int)targetV;
-		while (curr != -1) {
-			path.push_back((uint32_t)curr);
-			if ((uint32_t)curr == closestBoundaryV) break;
-			curr = prev[curr];
-		}
-
-		if (path.size() >= 2) {
-			for (size_t k = 1; k < path.size(); k++) {
-				uint32_t u = path[k - 1];
-				uint32_t v = path[k];
-				uint32_t newV = (uint32_t)curPositions.size();
-				curPositions.push_back(curPositions[v]);
-				curVmap.push_back(curVmap[v]);
-				for (uint32_t f = 0; f < curFCount; f++) {
-					uint32_t i0 = curIndices[f * 3 + 0];
-					uint32_t i1 = curIndices[f * 3 + 1];
-					uint32_t i2 = curIndices[f * 3 + 2];
-					if ((i0 == u && i1 == v) || (i1 == u && i2 == v) || (i2 == u && i0 == v)) {
-						if (curIndices[f * 3 + 0] == v) curIndices[f * 3 + 0] = newV;
-						if (curIndices[f * 3 + 1] == v) curIndices[f * 3 + 1] = newV;
-						if (curIndices[f * 3 + 2] == v) curIndices[f * 3 + 2] = newV;
-						break;
-					}
-				}
-			}
-			splitCount++;
-		}
-	}
-
-	return false;
+    trace("graph_fallback_start");
+    auto start=safeuv::Clock::now();
+    stats.fallbackCount=1;
+    safeuv::RepairPiece input;
+    input.faces=original; input.vmap.resize(vertexCount); input.faceIds.resize(faceCount);
+    std::iota(input.vmap.begin(),input.vmap.end(),0);
+    std::iota(input.faceIds.begin(),input.faceIds.end(),0);
+    std::vector<safeuv::RepairPiece> pieces;
+    bool success=safeuv::repair(std::move(input),pieces,stats);
+    if(success)success=safeuv::assemble(positions,faceCount,pieces,stats,outUvs,outIndices,outVmap);
+    stats.fallbackSeconds=safeuv::seconds(start);
+    stats.repairPieces=int(pieces.size());
+    splitCount=stats.topologyCuts+std::max(0,int(pieces.size())-1);
+    if(!success){outUvs.clear();outIndices.clear();outVmap.clear();}
+    trace(success?"graph_fallback_valid":"graph_fallback_failed");
+    return success;
 }
 
 struct PiecewiseParam
@@ -10229,6 +10084,162 @@ bool ParameterizeLscm(
 )
 {
 	return internal::param::ParameterizeLscmImpl(positions, vertexCount, indices, faceCount, outUvs, outIndices, outVmap, splitCount);
+}
+
+struct LscmBatchTaskGroupArgs
+{
+	const float *positions = nullptr;
+	const int32_t *indices = nullptr;
+	const int32_t *vertexOffsets = nullptr;
+	const int32_t *faceOffsets = nullptr;
+	uint32_t chartCount = 0;
+	std::vector<LscmChartResult> *results = nullptr;
+	LscmProgressFunc progressFunc = nullptr;
+	void *progressUserData = nullptr;
+	LscmTraceFunc traceFunc = nullptr;
+	void *traceUserData = nullptr;
+	std::atomic<uint32_t> completed{ 0 };
+	std::atomic<bool> cancelled{ false };
+	uint32_t progressInterval = 1;
+};
+
+struct LscmBatchTaskArgs
+{
+	LscmBatchTaskGroupArgs *group = nullptr;
+	uint32_t chartIndex = 0;
+};
+
+static void runLscmBatchTask(void *groupUserData, void *taskUserData)
+{
+	LscmBatchTaskGroupArgs *group = (LscmBatchTaskGroupArgs *)groupUserData;
+	LscmBatchTaskArgs *task = (LscmBatchTaskArgs *)taskUserData;
+	if (group->cancelled.load(std::memory_order_relaxed))
+		return;
+
+	const uint32_t chartIndex = task->chartIndex;
+	const uint32_t vertexBegin = uint32_t(group->vertexOffsets[chartIndex]);
+	const uint32_t vertexEnd = uint32_t(group->vertexOffsets[chartIndex + 1]);
+	const uint32_t faceBegin = uint32_t(group->faceOffsets[chartIndex]);
+	const uint32_t faceEnd = uint32_t(group->faceOffsets[chartIndex + 1]);
+	const uint32_t chartVertexCount = vertexEnd - vertexBegin;
+	const uint32_t chartFaceCount = faceEnd - faceBegin;
+	LscmChartResult &result = (*group->results)[chartIndex];
+	if (group->traceFunc)
+		group->traceFunc(chartIndex, "chart_start", chartVertexCount, chartFaceCount, group->traceUserData);
+
+	try {
+	result.success = internal::param::ParameterizeLscmImpl(
+		group->positions + vertexBegin * 3,
+		chartVertexCount,
+		group->indices + faceBegin * 3,
+		chartFaceCount,
+		result.uvs,
+		result.indices,
+		result.vmap,
+		result.splitCount,
+		group->traceFunc,
+		chartIndex,
+		group->traceUserData,
+		&result
+	);
+	} catch (const std::exception &) {
+		// An exception must never escape a worker thread and terminate Python.
+		result.success = false;
+		result.invalidIssue = 7;
+		result.uvs.clear(); result.indices.clear(); result.vmap.clear();
+	}
+	if (group->traceFunc)
+		group->traceFunc(
+			chartIndex,
+			result.success ? "chart_end_success" : "chart_end_failure",
+			chartVertexCount,
+			chartFaceCount,
+			group->traceUserData
+		);
+
+	const uint32_t completed = group->completed.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (group->progressFunc && (completed == group->chartCount || completed % group->progressInterval == 0)) {
+		if (!group->progressFunc(completed, group->chartCount, group->progressUserData))
+			group->cancelled.store(true, std::memory_order_relaxed);
+	}
+}
+
+void ParameterizeLscmBatch(
+	Atlas *atlas,
+	const float *positions,
+	uint32_t vertexCount,
+	const int32_t *indices,
+	uint32_t faceCount,
+	const int32_t *vertexOffsets,
+	const int32_t *faceOffsets,
+	uint32_t chartCount,
+	std::vector<LscmChartResult> &results,
+	LscmProgressFunc progressFunc,
+	void *progressUserData,
+	LscmTraceFunc traceFunc,
+	void *traceUserData
+)
+{
+	results.clear();
+	results.resize(chartCount);
+	if (chartCount == 0)
+		return;
+
+	// Reuse the scheduler owned by this atlas instead of creating another
+	// thread pool.
+	Context *ctx = (Context *)atlas;
+	XA_DEBUG_ASSERT(ctx->taskScheduler != nullptr);
+
+	LscmBatchTaskGroupArgs groupArgs;
+	groupArgs.positions = positions;
+	groupArgs.indices = indices;
+	groupArgs.vertexOffsets = vertexOffsets;
+	groupArgs.faceOffsets = faceOffsets;
+	groupArgs.chartCount = chartCount;
+	groupArgs.results = &results;
+	groupArgs.progressFunc = progressFunc;
+	groupArgs.progressUserData = progressUserData;
+	groupArgs.traceFunc = traceFunc;
+	groupArgs.traceUserData = traceUserData;
+	groupArgs.progressInterval = chartCount / 100;
+	if (groupArgs.progressInterval == 0)
+		groupArgs.progressInterval = 1;
+
+	internal::TaskGroupHandle taskGroup = ctx->taskScheduler->createTaskGroup(&groupArgs, chartCount);
+	std::vector<uint32_t> chartOrder(chartCount);
+	for (uint32_t i = 0; i < chartCount; i++)
+		chartOrder[i] = i;
+
+	// LSCM cost is strongly correlated with chart size. Submit expensive charts
+	// first so they are distributed across the worker pool early, reducing the
+	// long tail where only one or two large charts remain. Tasks still carry
+	// their original chart index, so result ordering is unchanged.
+	std::stable_sort(chartOrder.begin(), chartOrder.end(), [&](uint32_t a, uint32_t b) {
+		const uint64_t aVertexCount = uint64_t(vertexOffsets[a + 1]) - uint64_t(vertexOffsets[a]);
+		const uint64_t bVertexCount = uint64_t(vertexOffsets[b + 1]) - uint64_t(vertexOffsets[b]);
+		const uint64_t aFaceCount = uint64_t(faceOffsets[a + 1]) - uint64_t(faceOffsets[a]);
+		const uint64_t bFaceCount = uint64_t(faceOffsets[b + 1]) - uint64_t(faceOffsets[b]);
+		const uint64_t aCost = aVertexCount + aFaceCount;
+		const uint64_t bCost = bVertexCount + bFaceCount;
+		if (aCost != bCost)
+			return aCost > bCost;
+		if (aFaceCount != bFaceCount)
+			return aFaceCount > bFaceCount;
+		if (aVertexCount != bVertexCount)
+			return aVertexCount > bVertexCount;
+		return a < b;
+	});
+
+	std::vector<LscmBatchTaskArgs> taskArgs(chartCount);
+	for (uint32_t submissionIndex = 0; submissionIndex < chartCount; submissionIndex++) {
+		taskArgs[submissionIndex].group = &groupArgs;
+		taskArgs[submissionIndex].chartIndex = chartOrder[submissionIndex];
+		internal::Task task;
+		task.userData = &taskArgs[submissionIndex];
+		task.func = runLscmBatchTask;
+		ctx->taskScheduler->run(taskGroup, task);
+	}
+	ctx->taskScheduler->wait(&taskGroup);
 }
 
 } // namespace cumesh_xatlas

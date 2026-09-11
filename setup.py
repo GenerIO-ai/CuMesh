@@ -97,6 +97,7 @@ main_sources = [
     "src/connectivity.cu",
     "src/geometry.cu",
     "src/io.cu",
+    "src/normalize.cu",
     "src/simplify.cu",
     "src/shared.cu",
     "src/remesh/simple_dual_contour.cu",

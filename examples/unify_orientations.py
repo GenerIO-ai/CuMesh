@@ -6,9 +6,9 @@ import utils
 
 
 if __name__ == "__main__":
-    mesh = utils.get_bunny()
+    mesh = utils.load_mesh("example-01.glb")
     mesh.faces = np.where(np.random.rand(mesh.faces.shape[0], 1) < 0.5, mesh.faces, mesh.faces[:,::-1])
-    mesh.export("original.ply")
+    utils.save_mesh(mesh, "original.ply")
     vertices = torch.from_numpy(mesh.vertices).float()
     faces = torch.from_numpy(mesh.faces).int()
     print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
@@ -27,4 +27,4 @@ if __name__ == "__main__":
     print(f"Orientation unified mesh: {new_vertices.shape[0]} vertices, {new_faces.shape[0]} faces")
 
     new_mesh = trimesh.Trimesh(vertices=new_vertices.cpu().numpy(), faces=new_faces.cpu().numpy(), process=False)
-    new_mesh.export("oriented.ply")
+    utils.save_mesh(new_mesh, "oriented.ply")

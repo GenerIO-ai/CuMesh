@@ -70,18 +70,49 @@ class Atlas:
 
         self.atlas.add_uv_mesh(uvs, faces, face_materials)
 
+    def _parameterize_lscm_batch(
+        self,
+        vertices: torch.Tensor,
+        faces: torch.Tensor,
+        vertex_offsets: torch.Tensor,
+        face_offsets: torch.Tensor,
+        progress_callback=None,
+        trace_callback=None,
+    ):
+        """Parameterize packed charts concurrently using the native xatlas pool."""
+        return self.atlas._parameterize_lscm_batch(
+            vertices,
+            faces,
+            vertex_offsets,
+            face_offsets,
+            progress_callback,
+            trace_callback,
+        )
+
+    def _lscm_stats(self):
+        return self.atlas._lscm_stats()
+
+    def _atlas_info(self):
+        return self.atlas._atlas_info()
+
+    def _mesh_atlas_indices(self, index):
+        return self.atlas._mesh_atlas_indices(index)
+
+    def _validate_uv(self, uvs, faces):
+        return self.atlas._validate_uv(uvs, faces)
+
     def compute_charts(self, 
                        max_chart_area: float = 0.0,
                        max_boundary_length: float = 0.0,
-                       normal_deviation_weight: float = 2.0,
-                       roundness_weight: float = 0.01,
-                       straightness_weight: float = 6.0,
-                       normal_seam_weight: float = 4.0,
-                       texture_seam_weight: float = 0.5,
-                       max_cost: float = 2.0,
-                       max_iterations: int = 1,
+                       normal_deviation_weight: float = 0.0, #2.0,
+                       roundness_weight: float = 0.0, #0.01,
+                       straightness_weight: float = 0.0, #6.0,
+                       normal_seam_weight: float = 0.0, #4.0,
+                       texture_seam_weight: float = 0.0, #0.5,
+                       max_cost: float = 1000.0, #2.0,
+                       max_iterations: int = 3, #1,
                        use_input_mesh_uvs: bool = False,
-                       fix_winding: bool = False,
+                       fix_winding: bool = True, #False,
                        verbose: bool = False):
         """
         Compute charts (parameterization) for the added meshes.

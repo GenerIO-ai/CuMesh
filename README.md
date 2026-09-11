@@ -36,7 +36,7 @@ runtime dependencies:
 
 ```bash
 python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-python -m pip install numpy scipy tqdm
+python -m pip install numpy scipy tqdm 
 python -m pip install cumesh-0.9.0-<platform>.whl
 ```
 
@@ -98,7 +98,8 @@ native extension import and geometry tests must run on a CUDA-capable host.
 * `init(vertices, faces)`: initialize a mesh with `[V, 3]` and `[F, 3]` CUDA tensors.
 * `read()`: return the current vertex and face tensors.
 * `simplify(target_num_faces, verbose=False, options={})`: GPU mesh decimation.
-* `uv_unwrap(verbose=False, ...)`: generate UVs using accelerated clustering and xatlas.
+* `normalize(min_area_abs=1e-24, min_area_rel=1e-12, iterations=1, verbose=False)`: split non-manifold edges once and collapse small interior triangles on the GPU.
+* `uv_unwrap(verbose=False, debug_charts=False, ...)`: generate packed UVs from CuMesh charts; optionally return a chart-colored debug texture.
 * `merge_micro_charts(...)`: merge small adjacent UV charts.
 * `fill_holes(max_hole_perimeter)`: triangulate and close boundary loops.
 * `repair_non_manifold_edges()`: split edges to resolve non-manifold geometry.
@@ -110,10 +111,15 @@ native extension import and geometry tests must run on a CUDA-capable host.
 * `get_connected_components()`, `get_boundary_loops()`: query mesh connectivity.
 * Properties: `num_vertices`, `num_faces`, `num_edges`, and `num_boundaries`.
 
-`uv_unwrap(..., preserve_cumesh_charts=True)` keeps CuMesh chart boundaries while using
-native LSCM parameterization and xatlas packing. `return_stats=True` is additive and returns
-chart-cleanup statistics; existing call signatures and return formats remain available by
-default.
+`uv_unwrap(...)` normalizes the mesh, computes CuMesh charts, parameterizes each chart with
+native LSCM, adds the parameterized charts to xatlas, and packs them with four-pixel padding
+by default. It returns `(vertices, faces, uvs)` by default. With `debug_charts=True`, it also
+returns `(vertices, faces, uvs, chart_texture)`, where `chart_texture` is a CPU `uint8` RGBA
+tensor containing one deterministic color per chart. Texture generation is skipped entirely
+when `debug_charts=False`. `return_vmaps=True` and `return_stats=True` remain additive.
+
+For verbose phase timing, pass `verbose=True`. To trace each native LSCM chart and solver
+phase, set `CUMESH_UV_TRACE=1` before running the application.
 
 ### `cumesh.remeshing`
 
@@ -139,22 +145,21 @@ vertex-merging, and CPU decimation wrappers, including `cuHashTable`, `HashTable
 
 `cumesh.xatlas.parameterize_lscm(vertices, faces)` is the native CPU LSCM parameterizer.
 
-## Extended UV unwrapping capabilities
+## UV unwrapping pipeline
 
-CuMesh's UV pipeline has been extended for workflows that need stable, reusable chart
-boundaries in addition to standard xatlas unwrapping. The extended path can:
+CuMesh's UV pipeline uses the following single path:
 
-* clean up micro-charts and split disconnected or filament-like chart regions;
-* preserve CuMesh chart boundaries during UV generation;
+* use the CuMesh chart boundaries directly;
+* return a chart-colored debug texture after chart parameterization and packing;
 * parameterize charts with the native CPU LSCM implementation;
 * pack already-parameterized charts through `Atlas.add_uv_mesh`; and
-* return optional chart-cleanup statistics without changing the default return format.
+* return optional parameterization and packing statistics.
 
 The functionality is implemented in CuMesh's public modules and native extensions:
 
 | Capability | CuMesh destination | Notes |
 | --- | --- | --- |
-| Chart cleanup and preserved-chart UVs | `cumesh/cumesh.py`, `src/` | Existing APIs are retained; chart splitting, micro-chart merging, preserved-chart UVs, and optional stats are additive. |
+| CuMesh chart UVs | `cumesh/cumesh.py`, `src/` | CuMesh chart boundaries are parameterized directly and passed to xatlas as UV meshes. |
 | Atlas and LSCM | `cumesh/xatlas.py`, `third_party/xatlas/` | Adds `add_uv_mesh` and `parameterize_lscm` without changing existing Atlas APIs. |
 | cuBVH and reusable mesh utilities | `cumesh/bvh.py`, `third_party/cubvh/` | Packaged as `cumesh._cubvh`; CUDA-only distance and ray operations remain CUDA-only. |
 | Remeshing support | `cumesh/remeshing.py`, `src/remesh/` | Existing CuMesh kernels and the packaged BVH backend are reused. |

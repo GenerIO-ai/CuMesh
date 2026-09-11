@@ -376,6 +376,15 @@ public:
     void remove_degenerate_faces(float abs_thresh, float rel_thresh);
 
     /**
+     * Normalize mesh topology and collapse small interior triangles.
+     *
+     * Stage 1 performs one global split of edges incident to more than two
+     * faces. Stage 2 performs the requested number of GPU collapse passes on
+     * triangles below the supplied area thresholds.
+     */
+    void normalize(float min_area_abs, float min_area_rel, int iterations, bool verbose=false);
+
+    /**
      * Fill holes.
      * This function requires:
      * - loop_boundaries

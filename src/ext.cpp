@@ -53,6 +53,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_unreferenced_vertices", &cumesh::CuMesh::remove_unreferenced_vertices)
         .def("remove_duplicate_faces", &cumesh::CuMesh::remove_duplicate_faces)
         .def("remove_degenerate_faces", &cumesh::CuMesh::remove_degenerate_faces)
+        .def("normalize", &cumesh::CuMesh::normalize,
+            py::arg("min_area_abs") = 1e-24f,
+            py::arg("min_area_rel") = 1e-12f,
+            py::arg("iterations") = 1,
+            py::arg("verbose") = false)
         .def("fill_holes", &cumesh::CuMesh::fill_holes)
         .def("repair_non_manifold_edges", &cumesh::CuMesh::repair_non_manifold_edges)
         .def("remove_non_manifold_faces", &cumesh::CuMesh::remove_non_manifold_faces)

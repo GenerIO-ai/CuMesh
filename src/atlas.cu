@@ -1222,6 +1222,7 @@ static __global__ void evaluate_micro_chart_merges_kernel(
     int end = chart2edge_offset[c + 1];
     int best_neighbor = -1;
     float max_shared = 0.0f;
+    const float area_threshold = total_area * min_area_ratio;
 
     for (int e = start; e < end; e++) {
         int eid = chart2edge[e];
@@ -1230,18 +1231,39 @@ static __global__ void evaluate_micro_chart_merges_kernel(
         int c1 = int(adj & 0xFFFFFFFF);
         int neighbor = (c0 == c) ? c1 : c0;
         float len = chart_adj_length[eid];
-        if (len > max_shared) {
+        if (len <= 0.0f) continue;
+
+        // Parent links must follow a strict, deterministic ordering. Otherwise
+        // two charts that are both tiny by area (but both have >= min_faces) can
+        // select each other and create a cycle for flatten_chart_parents_kernel.
+        const int neighbor_faces = chart_face_counts[neighbor];
+        const float neighbor_area = chart_areas[neighbor];
+        const bool neighbor_is_tiny =
+            (neighbor_area < area_threshold) || (neighbor_faces < min_faces);
+
+        // A non-tiny chart always outranks a tiny chart. If both are tiny, use
+        // a lexicographically ordered rank so every accepted parent link is
+        // strictly one-way: face count, area, then chart id.
+        bool parent_is_higher_rank = !neighbor_is_tiny;
+        if (neighbor_is_tiny) {
+            parent_is_higher_rank =
+                neighbor_faces > faces ||
+                (neighbor_faces == faces && neighbor_area > area) ||
+                (neighbor_faces == faces && neighbor_area == area && neighbor < c);
+        }
+        if (!parent_is_higher_rank) continue;
+
+        // Select the longest eligible boundary. The chart with the longest
+        // boundary may not be a valid parent, so eligibility is checked before
+        // comparing candidates. Chart id makes equal-length ties deterministic.
+        if (best_neighbor < 0 || len > max_shared ||
+            (len == max_shared && neighbor < best_neighbor)) {
             max_shared = len;
             best_neighbor = neighbor;
         }
     }
 
-    if (best_neighbor < 0 || max_shared <= 0.0f) return;
-
-    if (chart_face_counts[best_neighbor] > faces ||
-        (chart_face_counts[best_neighbor] == faces && chart_areas[best_neighbor] > area) ||
-        (chart_face_counts[best_neighbor] == faces && chart_areas[best_neighbor] == area && best_neighbor < c) ||
-        (chart_face_counts[best_neighbor] >= min_faces)) {
+    if (best_neighbor >= 0) {
         chart_parents[c] = best_neighbor;
         atomicAdd(merge_count, 1);
     }
@@ -1250,15 +1272,35 @@ static __global__ void evaluate_micro_chart_merges_kernel(
 
 static __global__ void flatten_chart_parents_kernel(
     int* chart_parents,
-    const int num_charts
+    const int num_charts,
+    int* invalid_parent_flag
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_charts) return;
+
     int curr = tid;
-    while (curr != chart_parents[curr]) {
-        curr = chart_parents[curr];
+
+    // Parent links are expected to be acyclic because the merge kernel uses a
+    // strict rank. Keep this bounded as a defensive backstop: malformed or
+    // future parent-selection logic must never turn into an infinite kernel.
+    for (int step = 0; step < num_charts; step++) {
+        const int parent = chart_parents[curr];
+        if (parent == curr) {
+            chart_parents[tid] = curr;
+            return;
+        }
+        if (parent < 0 || parent >= num_charts) {
+            atomicExch(invalid_parent_flag, 1);
+            chart_parents[tid] = tid;
+            return;
+        }
+        curr = parent;
     }
-    chart_parents[tid] = curr;
+
+    // A cycle is an invalid merge result. Mark it and make this entry a
+    // self-root; the host skips the remap for this iteration below.
+    atomicExch(invalid_parent_flag, 1);
+    chart_parents[tid] = tid;
 }
 
 
@@ -1288,6 +1330,8 @@ int CuMesh::merge_micro_charts(
 
     int* cu_merge_count;
     CUDA_CHECK(cudaMalloc(&cu_merge_count, sizeof(int)));
+    int* cu_invalid_parent_flag;
+    CUDA_CHECK(cudaMalloc(&cu_invalid_parent_flag, sizeof(int)));
 
     for (int iter = 0; iter < merge_iterations; iter++) {
         if (this->atlas_num_charts <= 1) {
@@ -1370,11 +1414,28 @@ int CuMesh::merge_micro_charts(
             break;
         }
 
+        CUDA_CHECK(cudaMemset(cu_invalid_parent_flag, 0, sizeof(int)));
         flatten_chart_parents_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
             cu_chart_parents,
-            C
+            C,
+            cu_invalid_parent_flag
         );
         CUDA_CHECK(cudaGetLastError());
+
+        int h_invalid_parent = 0;
+        CUDA_CHECK(cudaMemcpy(
+            &h_invalid_parent,
+            cu_invalid_parent_flag,
+            sizeof(int),
+            cudaMemcpyDeviceToHost
+        ));
+        if (h_invalid_parent != 0) {
+            // Do not apply a potentially cyclic or otherwise malformed
+            // remap. The next stages can safely operate on the unchanged
+            // chart assignment.
+            CUDA_CHECK(cudaFree(cu_chart_parents));
+            break;
+        }
 
         apply_chart_remap_kernel<<<(F + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
             this->atlas_chart_ids.ptr,
@@ -1389,6 +1450,7 @@ int CuMesh::merge_micro_charts(
     }
 
     CUDA_CHECK(cudaFree(cu_merge_count));
+    CUDA_CHECK(cudaFree(cu_invalid_parent_flag));
 
     reassign_chart_ids(*this);
     construct_chart_mesh(*this);

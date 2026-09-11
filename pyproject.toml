@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cumesh"
-version = "0.9.0"
+version = "0.9.1"
 description = "Cuda mesh utils"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -24,6 +24,13 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.14.1",
     "tqdm",
+]
+
+[project.optional-dependencies]
+examples = [
+    "pillow>=11.0.0",
+    "trimesh>=4.5.1",
+    "requests"
 ]
 
 [tool.setuptools]

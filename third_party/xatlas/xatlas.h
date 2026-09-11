@@ -179,6 +179,58 @@ bool ParameterizeLscm(
 	int &splitCount
 );
 
+// Result of parameterizing one chart in a batch. This is an additive native
+// API used by the PyTorch binding; the existing single-chart API above remains
+// unchanged.
+struct LscmChartResult
+{
+	std::vector<float> uvs;
+	std::vector<int32_t> indices;
+	std::vector<int32_t> vmap;
+	bool success = false;
+	int splitCount = 0;
+	int fallbackCount = 0;
+	int repairPieces = 1;
+	int topologyCuts = 0;
+	int invalidIssue = 0;
+	uint64_t validationCandidates = 0;
+	double validationSeconds = 0.0;
+	double fallbackSeconds = 0.0;
+	double solveSeconds = 0.0;
+};
+
+// Progress callback for batched LSCM. Returning false requests cancellation.
+using LscmProgressFunc = bool (*)(uint32_t completed, uint32_t total, void *userData);
+
+// Optional diagnostic callback for batched LSCM. It is called from the worker
+// thread that owns the chart, so consumers must make it thread-safe.
+using LscmTraceFunc = void (*)(
+	uint32_t chartIndex,
+	const char *phase,
+	uint32_t vertexCount,
+	uint32_t faceCount,
+	void *userData
+);
+
+// The packed chart ranges are [vertexOffsets[i], vertexOffsets[i + 1]) and
+// [faceOffsets[i], faceOffsets[i + 1]). Indices in each chart are local to
+// that chart's vertex range.
+void ParameterizeLscmBatch(
+	Atlas *atlas,
+	const float *positions,
+	uint32_t vertexCount,
+	const int32_t *indices,
+	uint32_t faceCount,
+	const int32_t *vertexOffsets,
+	const int32_t *faceOffsets,
+	uint32_t chartCount,
+	std::vector<LscmChartResult> &results,
+	LscmProgressFunc progressFunc = nullptr,
+	void *progressUserData = nullptr,
+	LscmTraceFunc traceFunc = nullptr,
+	void *traceUserData = nullptr
+);
+
 // Custom parameterization function. texcoords initial values are an orthogonal parameterization.
 typedef void (*ParameterizeFunc)(const float *positions, float *texcoords, uint32_t vertexCount, const uint32_t *indices, uint32_t indexCount);
 
