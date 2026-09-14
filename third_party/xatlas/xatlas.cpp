@@ -6599,7 +6599,8 @@ bool ParameterizeLscmImpl(
     std::vector<float> &outUvs, std::vector<int32_t> &outIndices,
     std::vector<int32_t> &outVmap, int &splitCount,
     LscmTraceFunc traceFunc = nullptr, uint32_t traceChartIndex = UINT32_MAX,
-    void *traceUserData = nullptr, LscmChartResult *diagnostics = nullptr)
+    void *traceUserData = nullptr, LscmChartResult *diagnostics = nullptr,
+    bool flattenLscm = true, bool flattenTutte = true)
 {
     LscmChartResult localStats;
     LscmChartResult &stats = diagnostics ? *diagnostics : localStats;
@@ -6625,7 +6626,7 @@ bool ParameterizeLscmImpl(
     };
     // LSCM uses a locally consistent working copy only. Validation and output
     // always use the caller's corner order, including arbitrary face reversals.
-    if(coherent && hasBoundary) {
+    if(flattenLscm && coherent && hasBoundary) {
         trace("lscm_solve_start");
         auto start=safeuv::Clock::now();
         Mesh mesh(0.0f,vertexCount,faceCount);
@@ -6662,6 +6663,11 @@ bool ParameterizeLscmImpl(
         } else stats.invalidIssue=5; // numerical solve/convergence failure
     } else stats.invalidIssue=6; // topology requires graph recovery
 
+    if (!flattenTutte) {
+        trace("tutte_skipped");
+        return false;
+    }
+
     trace("graph_fallback_start");
     auto start=safeuv::Clock::now();
     stats.fallbackCount=1;
@@ -6670,8 +6676,18 @@ bool ParameterizeLscmImpl(
     std::iota(input.vmap.begin(),input.vmap.end(),0);
     std::iota(input.faceIds.begin(),input.faceIds.end(),0);
     std::vector<safeuv::RepairPiece> pieces;
-    bool success=safeuv::repair(std::move(input),pieces,stats);
+    bool success=safeuv::repair(input,pieces,stats,flattenTutte,positions);
     if(success)success=safeuv::assemble(positions,faceCount,pieces,stats,outUvs,outIndices,outVmap);
+    // A projected boundary can produce a valid Tutte map whose very thin
+    // triangles collapse during the final float32 assembly. Keep the
+    // projected experiment from making a chart fatal: retry that chart with
+    // the original circular boundary if assembly rejects it.
+    if(!success && positions) {
+        trace("graph_fallback_retry_circular");
+        pieces.clear();
+        success=safeuv::repair(input,pieces,stats,flattenTutte,nullptr);
+        if(success)success=safeuv::assemble(positions,faceCount,pieces,stats,outUvs,outIndices,outVmap);
+    }
     stats.fallbackSeconds=safeuv::seconds(start);
     stats.repairPieces=int(pieces.size());
     splitCount=stats.topologyCuts+std::max(0,int(pieces.size())-1);
@@ -10098,6 +10114,8 @@ struct LscmBatchTaskGroupArgs
 	void *progressUserData = nullptr;
 	LscmTraceFunc traceFunc = nullptr;
 	void *traceUserData = nullptr;
+	bool flattenLscm = true;
+	bool flattenTutte = true;
 	std::atomic<uint32_t> completed{ 0 };
 	std::atomic<bool> cancelled{ false };
 	uint32_t progressInterval = 1;
@@ -10140,7 +10158,9 @@ static void runLscmBatchTask(void *groupUserData, void *taskUserData)
 		group->traceFunc,
 		chartIndex,
 		group->traceUserData,
-		&result
+		&result,
+		group->flattenLscm,
+		group->flattenTutte
 	);
 	} catch (const std::exception &) {
 		// An exception must never escape a worker thread and terminate Python.
@@ -10177,7 +10197,9 @@ void ParameterizeLscmBatch(
 	LscmProgressFunc progressFunc,
 	void *progressUserData,
 	LscmTraceFunc traceFunc,
-	void *traceUserData
+	void *traceUserData,
+	bool flattenLscm,
+	bool flattenTutte
 )
 {
 	results.clear();
@@ -10201,6 +10223,8 @@ void ParameterizeLscmBatch(
 	groupArgs.progressUserData = progressUserData;
 	groupArgs.traceFunc = traceFunc;
 	groupArgs.traceUserData = traceUserData;
+	groupArgs.flattenLscm = flattenLscm;
+	groupArgs.flattenTutte = flattenTutte;
 	groupArgs.progressInterval = chartCount / 100;
 	if (groupArgs.progressInterval == 0)
 		groupArgs.progressInterval = 1;

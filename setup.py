@@ -150,7 +150,7 @@ ext_modules = [
 
 setup(
     name="cumesh",
-    version="0.9.0",
+    version="0.9.1",
     packages=find_packages(include=["cumesh", "cumesh.*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

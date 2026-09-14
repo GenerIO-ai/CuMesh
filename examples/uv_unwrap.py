@@ -10,7 +10,7 @@ from time import perf_counter
 
 
 # Select the identifier for the mesh to unwrap
-IDENTIFIER = "example-03"
+IDENTIFIER = "example-05"
 
 
 if __name__ == "__main__":
@@ -31,17 +31,21 @@ if __name__ == "__main__":
     mesh.init(vertices, faces)
 
     new_vertices, new_faces, uv, chart_texture = mesh.uv_unwrap(
-        verbose=True,
+        flatten=["project"],
         debug_charts=True,
+        verbose=True
     )
 
     print(f"Packed UV mesh: {new_vertices.shape[0]} vertices, {new_faces.shape[0]} faces")
 
-    image_texture=Image.fromarray(chart_texture.detach().cpu().numpy())
+    if chart_texture is not None:
+        image_texture=Image.fromarray(chart_texture.detach().cpu().numpy())
+
     visual = trimesh.visual.texture.TextureVisuals(
         uv=uv.detach().cpu().numpy(),
-        image=image_texture,
+        image=image_texture if chart_texture is not None else None,
     )
+
     new_mesh = trimesh.Trimesh(
         vertices=new_vertices.cpu().numpy(), 
         faces=new_faces.cpu().numpy(), 

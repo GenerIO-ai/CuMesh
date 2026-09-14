@@ -78,9 +78,20 @@ class Atlas:
         face_offsets: torch.Tensor,
         progress_callback=None,
         trace_callback=None,
+        flatten_lscm: bool = True,
+        flatten_tutte: bool = True,
     ):
-        """Parameterize packed charts concurrently using the native xatlas pool."""
-        return self.atlas._parameterize_lscm_batch(
+        """Parameterize packed charts using the selected native flatteners.
+
+        ``flatten_lscm`` and ``flatten_tutte`` control the native LSCM stage
+        and its graph/Tutte fallback independently.  Both default to true for
+        backwards compatibility.
+        """
+        # The all-enabled call is kept compatible with extensions built
+        # before the stage switches were added.  Selective modes require the
+        # rebuilt binding because the native implementation must skip the
+        # disabled solver rather than merely ignoring the Python option.
+        args = (
             vertices,
             faces,
             vertex_offsets,
@@ -88,6 +99,19 @@ class Atlas:
             progress_callback,
             trace_callback,
         )
+        if flatten_lscm and flatten_tutte:
+            return self.atlas._parameterize_lscm_batch(*args)
+        try:
+            return self.atlas._parameterize_lscm_batch(
+                *args,
+                flatten_lscm=flatten_lscm,
+                flatten_tutte=flatten_tutte,
+            )
+        except TypeError as error:
+            raise RuntimeError(
+                "Selective flattening requires rebuilding the cumesh "
+                "_cumesh_xatlas extension"
+            ) from error
 
     def _lscm_stats(self):
         return self.atlas._lscm_stats()
@@ -100,6 +124,12 @@ class Atlas:
 
     def _validate_uv(self, uvs, faces):
         return self.atlas._validate_uv(uvs, faces)
+
+    def _split_uv_overlaps(self, uvs, faces):
+        return self.atlas._split_uv_overlaps(uvs, faces)
+
+    def _optimize_uv_distortion(self, positions, uvs, faces):
+        return self.atlas._optimize_uv_distortion(positions, uvs, faces)
 
     def compute_charts(self, 
                        max_chart_area: float = 0.0,

@@ -37,7 +37,7 @@ runtime dependencies:
 ```bash
 python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 python -m pip install numpy scipy tqdm 
-python -m pip install cumesh-0.9.0-<platform>.whl
+python -m pip install cumesh-0.9.1-<platform>.whl
 ```
 
 The compiled extension is linked against the PyTorch C++ ABI selected by the build's
@@ -82,7 +82,7 @@ On a clean CUDA-capable machine with the documented PyTorch runtime:
 ```bash
 python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 python -m pip install numpy scipy tqdm
-python -m pip install --no-deps dist/cumesh-0.9.0-*.whl
+python -m pip install --no-deps dist/cumesh-0.9.1-*.whl
 python -c "import cumesh; import cumesh._C, cumesh._cubvh, cumesh._cumesh_xatlas; print(cumesh.__version__)"
 python -m unittest discover -s tests -v
 ```
@@ -99,7 +99,7 @@ native extension import and geometry tests must run on a CUDA-capable host.
 * `read()`: return the current vertex and face tensors.
 * `simplify(target_num_faces, verbose=False, options={})`: GPU mesh decimation.
 * `normalize(min_area_abs=1e-24, min_area_rel=1e-12, iterations=1, verbose=False)`: split non-manifold edges once and collapse small interior triangles on the GPU.
-* `uv_unwrap(verbose=False, debug_charts=False, ...)`: generate packed UVs from CuMesh charts; optionally return a chart-colored debug texture.
+* `uv_unwrap(verbose=False, debug_charts=False, flatten=["project"], ...)`: generate packed UVs from CuMesh charts; optionally return a chart-colored debug texture.
 * `merge_micro_charts(...)`: merge small adjacent UV charts.
 * `fill_holes(max_hole_perimeter)`: triangulate and close boundary loops.
 * `repair_non_manifold_edges()`: split edges to resolve non-manifold geometry.
@@ -111,15 +111,43 @@ native extension import and geometry tests must run on a CUDA-capable host.
 * `get_connected_components()`, `get_boundary_loops()`: query mesh connectivity.
 * Properties: `num_vertices`, `num_faces`, `num_edges`, and `num_boundaries`.
 
-`uv_unwrap(...)` normalizes the mesh, computes CuMesh charts, parameterizes each chart with
-native LSCM, adds the parameterized charts to xatlas, and packs them with four-pixel padding
-by default. It returns `(vertices, faces, uvs)` by default. With `debug_charts=True`, it also
-returns `(vertices, faces, uvs, chart_texture)`, where `chart_texture` is a CPU `uint8` RGBA
-tensor containing one deterministic color per chart. Texture generation is skipped entirely
-when `debug_charts=False`. `return_vmaps=True` and `return_stats=True` remain additive.
+`uv_unwrap(...)` normalizes the mesh, computes CuMesh charts, and tries the requested
+flattening stages in order. Supported methods are `"lscm"`, `"project"`, `"tutte"`, and
+`"pca"`; for example, `flatten=["lscm", "tutte"]` uses Tutte only for charts where
+LSCM fails. The default is `flatten=["project"]`. If all requested stages fail, a
+last-resort planar UV is still returned. The parameterized charts are added to xatlas and
+packed with four-pixel padding by default. The method always returns
+`(vertices, faces, uvs, chart_texture)`, with `chart_texture=None` unless `debug_charts=True`.
+When enabled, `chart_texture` is a CPU `uint8` RGBA tensor containing one deterministic color
+per chart. With `verbose=True`, the final log includes disjoint counts for
+charts handled by native LSCM, the native graph fallback, and the Python PCA fallback.
+`return_vmaps=True` and `return_stats=True` remain additive; the latter includes the same
+method counts under `final_parameterization_methods` plus native fallback reason counters.
+The `"project"` stage is reported as `python_project` in those method counts.
+Problematic charts, dropped faces, missing mappings, packing fallbacks, and failed final
+validation are reported as console warnings with affected counts and percentages. The
+returned stats include `atlas_complete`, `dropped_charts`, `dropped_faces`,
+`unmapped_vertices`, `self_overlapping_charts`, `self_overlap_pairs`,
+`overlap_split_charts`, `distortion_optimized_charts`, and `uv_warning_level`.
+After flattening, a native BVH overlap pass separates connected UV conflict
+groups before packing; the common two-layer conflict creates one additional
+packed chart per connected group. A small native symmetric-Dirichlet pass then
+optimizes the final charts with a four-step budget, moving boundaries while
+rejecting flipped or degenerate triangles. Charts already close to the energy
+minimum are skipped, and charts that move are checked once more for overlap.
+The Project stage computes a direction-independent median of the chart triangle normals,
+aligns the chart to that plane, and projects all chart vertices onto it. The Tutte stage
+projects each chart boundary to a local 2D plane, uses its convex hull as the
+fixed Tutte polygon, and samples that polygon in the original boundary order using physical
+edge lengths. The old Tutte-only nonlinear pass remains disabled with
+`kEnableTutteDistortionOptimizer` in `third_party/xatlas/safe_uv.h` because the
+shared post-flatten pass supersedes it.
+The stage helpers are kept separately in `cumesh/flatten_lscm.py`,
+`cumesh/flatten_project.py`, `cumesh/flatten_tutte.py`, and
+`cumesh/flatten_pca.py`.
 
-For verbose phase timing, pass `verbose=True`. To trace each native LSCM chart and solver
-phase, set `CUMESH_UV_TRACE=1` before running the application.
+For verbose phase timing, pass `verbose=True`. To trace each native flattening chart and
+solver phase, set `CUMESH_UV_TRACE=1` before running the application.
 
 ### `cumesh.remeshing`
 

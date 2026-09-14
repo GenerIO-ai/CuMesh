@@ -228,7 +228,9 @@ void ParameterizeLscmBatch(
 	LscmProgressFunc progressFunc = nullptr,
 	void *progressUserData = nullptr,
 	LscmTraceFunc traceFunc = nullptr,
-	void *traceUserData = nullptr
+	void *traceUserData = nullptr,
+	bool flattenLscm = true,
+	bool flattenTutte = true
 );
 
 // Custom parameterization function. texcoords initial values are an orthogonal parameterization.

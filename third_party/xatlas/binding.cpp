@@ -122,6 +122,87 @@ public:
         return result;
     }
 
+    static py::tuple SplitUvOverlaps(const torch::Tensor &uv, const torch::Tensor &faces) {
+        check_tensor(uv, "uv", torch::kFloat32);
+        check_tensor(faces, "faces", torch::kInt32);
+        TORCH_CHECK(uv.dim()==2 && uv.size(1)==2, "uv must have shape [V,2]");
+        TORCH_CHECK(faces.dim()==2 && faces.size(1)==3, "faces must have shape [F,3]");
+        TORCH_CHECK(uv.size(0)<=std::numeric_limits<uint32_t>::max() &&
+                    faces.size(0)<=std::numeric_limits<uint32_t>::max(),
+                    "UV mesh too large");
+
+        cumesh_xatlas::safeuv::OverlapSplit split;
+        {
+            py::gil_scoped_release release;
+            split = cumesh_xatlas::safeuv::splitOverlappingUvFaces(
+                uv.data_ptr<float>(), faces.data_ptr<int32_t>(),
+                uint32_t(uv.size(0)), uint32_t(faces.size(0))
+            );
+        }
+        auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+        torch::Tensor groups;
+        if (split.groups.empty()) {
+            groups = torch::empty({0}, options);
+        } else {
+            groups = torch::from_blob(
+                split.groups.data(), {int64_t(split.groups.size())}, options
+            ).clone();
+        }
+        return py::make_tuple(
+            groups,
+            split.chartCount,
+            split.overlapFaces,
+            split.overlapPairs,
+            split.candidates,
+            split.valid,
+            split.limited
+        );
+    }
+
+    static bool OptimizeUvDistortion(
+        const torch::Tensor &positions,
+        torch::Tensor uv,
+        const torch::Tensor &faces
+    ) {
+        check_tensor(positions, "positions", torch::kFloat32);
+        check_tensor(uv, "uv", torch::kFloat32);
+        check_tensor(faces, "faces", torch::kInt32);
+        TORCH_CHECK(positions.dim() == 2 && positions.size(1) == 3,
+                    "positions must have shape [V,3]");
+        TORCH_CHECK(uv.dim() == 2 && uv.size(1) == 2,
+                    "uv must have shape [V,2]");
+        TORCH_CHECK(faces.dim() == 2 && faces.size(1) == 3,
+                    "faces must have shape [F,3]");
+        TORCH_CHECK(positions.size(0) == uv.size(0),
+                    "positions and uv must have the same vertex count");
+        TORCH_CHECK(positions.size(0) <= std::numeric_limits<int32_t>::max(),
+                    "UV mesh has too many vertices for distortion optimization");
+        TORCH_CHECK(faces.size(0) <= std::numeric_limits<int32_t>::max(),
+                    "UV mesh has too many faces for distortion optimization");
+
+        std::vector<int32_t> faceData(
+            static_cast<size_t>(faces.numel()));
+        std::memcpy(faceData.data(), faces.data_ptr<int32_t>(),
+                    sizeof(int32_t) * faceData.size());
+        std::vector<int32_t> vmap(static_cast<size_t>(positions.size(0)));
+        std::iota(vmap.begin(), vmap.end(), int32_t(0));
+        std::vector<float> optimizedUv(static_cast<size_t>(uv.numel()));
+        std::memcpy(optimizedUv.data(), uv.data_ptr<float>(),
+                    sizeof(float) * optimizedUv.size());
+
+        bool changed = false;
+        {
+            py::gil_scoped_release release;
+            changed = safeuv::optimize_uv_distortion(
+                positions.data_ptr<float>(), faceData, vmap, optimizedUv);
+        }
+        if (changed) {
+            std::memcpy(uv.data_ptr<float>(), optimizedUv.data(),
+                        sizeof(float) * optimizedUv.size());
+        }
+        return changed;
+    }
+
     XAtlasWrapper() {
         m_atlas = cumesh_xatlas::Create();
     }
@@ -197,7 +278,9 @@ public:
         const torch::Tensor& vertexOffsets,
         const torch::Tensor& faceOffsets,
         std::optional<py::function> progressCallback,
-        std::optional<py::function> traceCallback
+        std::optional<py::function> traceCallback,
+        bool flattenLscm,
+        bool flattenTutte
     ) {
         check_tensor(vertices, "vertices", torch::kFloat32);
         check_tensor(faces, "faces", torch::kInt32);
@@ -271,7 +354,9 @@ public:
                 progressCallback.has_value() ? &LscmProgressCallbackTrampoline : nullptr,
                 progressCallback.has_value() ? static_cast<void*>(&(*progressCallback)) : nullptr,
                 traceCallback.has_value() ? &LscmTraceCallbackTrampoline : nullptr,
-                traceCallback.has_value() ? static_cast<void*>(&(*traceCallback)) : nullptr
+                traceCallback.has_value() ? static_cast<void*>(&(*traceCallback)) : nullptr,
+                flattenLscm,
+                flattenTutte
             );
         }
 
@@ -346,11 +431,13 @@ public:
         auto outputFaceOffsets = torch::empty({static_cast<int64_t>(chartCount) + 1}, intOptions);
         auto success = torch::empty({chartCount}, boolOptions);
         auto splitCounts = torch::empty({chartCount}, intOptions);
+        auto fallbackCounts = torch::empty({chartCount}, intOptions);
 
         int32_t* outputVertexOffsetPtr = outputVertexOffsets.data_ptr<int32_t>();
         int32_t* outputFaceOffsetPtr = outputFaceOffsets.data_ptr<int32_t>();
         bool* successPtr = success.data_ptr<bool>();
         int32_t* splitCountPtr = splitCounts.data_ptr<int32_t>();
+        int32_t* fallbackCountPtr = fallbackCounts.data_ptr<int32_t>();
         int64_t vertexOffset = 0;
         int64_t faceOffset = 0;
         outputVertexOffsetPtr[0] = 0;
@@ -375,6 +462,7 @@ public:
             outputFaceOffsetPtr[i + 1] = static_cast<int32_t>(faceOffset);
             successPtr[i] = result.success;
             splitCountPtr[i] = result.splitCount;
+            fallbackCountPtr[i] = result.fallbackCount;
         }
 
         return py::make_tuple(
@@ -384,7 +472,8 @@ public:
             outputVertexOffsets,
             outputFaceOffsets,
             success,
-            splitCounts
+            splitCounts,
+            fallbackCounts
         );
     }
 
@@ -534,12 +623,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("_parameterize_lscm_batch", &cumesh_xatlas::XAtlasWrapper::ParameterizeLscmBatch,
             py::arg("vertices"), py::arg("faces"), py::arg("vertex_offsets"),
             py::arg("face_offsets"), py::arg("progress_callback") = py::none(),
-            py::arg("trace_callback") = py::none())
+            py::arg("trace_callback") = py::none(), py::arg("flatten_lscm") = true,
+            py::arg("flatten_tutte") = true)
         .def("get_mesh", &cumesh_xatlas::XAtlasWrapper::GetMesh)
         .def("_lscm_stats", &cumesh_xatlas::XAtlasWrapper::LscmStats)
         .def("_atlas_info", &cumesh_xatlas::XAtlasWrapper::AtlasInfo)
         .def("_mesh_atlas_indices", &cumesh_xatlas::XAtlasWrapper::MeshAtlasIndices)
-        .def_static("_validate_uv", &cumesh_xatlas::XAtlasWrapper::ValidateUv);
+        .def_static("_validate_uv", &cumesh_xatlas::XAtlasWrapper::ValidateUv)
+        .def_static("_split_uv_overlaps", &cumesh_xatlas::XAtlasWrapper::SplitUvOverlaps)
+        .def_static("_optimize_uv_distortion", &cumesh_xatlas::XAtlasWrapper::OptimizeUvDistortion);
 
     m.def("parameterize_lscm", &cumesh_xatlas::ParameterizeLscmBinding);
 }
