@@ -64,7 +64,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("remove_small_connected_components", &cumesh::CuMesh::remove_small_connected_components)
         .def("unify_face_orientations", &cumesh::CuMesh::unify_face_orientations)
         .def("simplify_step", &cumesh::CuMesh::simplify_step)
-        .def("compute_charts", &cumesh::CuMesh::compute_charts)
+        .def("compute_charts", &cumesh::CuMesh::compute_charts,
+            py::arg("threshold_cone_half_angle_rad"),
+            py::arg("refine_iterations"), py::arg("global_iterations"),
+            py::arg("smooth_strength"), py::arg("area_penalty_weight"),
+            py::arg("perimeter_area_ratio_weight"),
+            py::arg("chart_merge_target") = 32,
+            py::arg("chart_merge_strength") = 0.8f)
         .def("merge_micro_charts", &cumesh::CuMesh::merge_micro_charts,
             py::arg("min_area_ratio") = 0.0005f,
             py::arg("min_faces") = 128,

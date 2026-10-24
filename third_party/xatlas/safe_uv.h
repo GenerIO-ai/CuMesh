@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -56,12 +57,13 @@ struct Box {
 };
 
 class Validator {
-    struct Node { Box box; uint32_t begin, end, left = 0, right = 0; };
+    struct Node { Box box; uint32_t begin, end, left = 0, right = 0, parent = UINT32_MAX; };
     const float *uv;
     const int32_t *faces;
     std::vector<Box> boxes;
     std::vector<uint32_t> order;
     std::vector<Node> nodes;
+    std::vector<uint32_t> faceLeaf;
     uint32_t build(uint32_t begin, uint32_t end) {
         Node n; n.begin = begin; n.end = end;
         for (uint32_t i = begin; i < end; ++i) n.box.add(boxes[order[i]]);
@@ -77,6 +79,10 @@ class Validator {
                 });
             nodes[id].left = build(begin, middle);
             nodes[id].right = build(middle, end);
+            nodes[nodes[id].left].parent = id;
+            nodes[nodes[id].right].parent = id;
+        } else {
+            for (uint32_t i = begin; i < end; ++i) faceLeaf[order[i]] = id;
         }
         return id;
     }
@@ -175,12 +181,72 @@ class Validator {
                 result.issue = 2; result.face0 = f; return false;
             }
         }
-        nodes.clear();
+        nodes.clear(); faceLeaf.resize(faceCount);
         if (faceCount) { nodes.reserve(faceCount / 2 + 1); build(0, faceCount); }
+        return true;
+    }
+    template<class Accept>
+    bool queryNode(uint32_t node, uint32_t face, const Box &box,
+                   const std::vector<uint8_t> &excluded, Accept &accept,
+                   uint64_t &budget, bool &exhausted) const {
+        if (!budget) { exhausted = true; return false; }
+        --budget;
+        const auto &n = nodes[node];
+        if (!box.intersects(n.box)) return true;
+        if (n.left) return queryNode(n.left,face,box,excluded,accept,budget,exhausted)
+            && queryNode(n.right,face,box,excluded,accept,budget,exhausted);
+        for (uint32_t i = n.begin; i < n.end; ++i) {
+            if (!budget) { exhausted = true; return false; }
+            --budget;
+            uint32_t other = order[i];
+            if (excluded[other] || !box.intersects(boxes[other])) continue;
+            if (overlap(face,other) && !accept(face,other)) return false;
+        }
         return true;
     }
 public:
     Validator(const float *u, const int32_t *f) : uv(u), faces(f) {}
+    bool overlaps(uint32_t a, uint32_t b) const { return overlap(a,b); }
+    bool usableTriangle(uint32_t f) const {
+        const float *p[3];
+        for (int k = 0; k < 3; ++k) {
+            p[k] = uv + 2*size_t(faces[3*size_t(f)+k]);
+            if (!std::isfinite(p[k][0]) || !std::isfinite(p[k][1])) return false;
+        }
+        double scale = 0;
+        for (int k = 0; k < 3; ++k) {
+            double x = double(p[k][0])-p[(k+1)%3][0], y = double(p[k][1])-p[(k+1)%3][1];
+            scale = std::max(scale,x*x+y*y);
+        }
+        double area = (double(p[1][0])-p[0][0])*(double(p[2][1])-p[0][1])
+                    - (double(p[1][1])-p[0][1])*(double(p[2][0])-p[0][0]);
+        // Reject float32 slivers without imposing an absolute chart scale.
+        return orient(p[0],p[1],p[2]) != 0 && std::abs(area) > 1e-8*scale;
+    }
+    template<class Accept>
+    bool queryTriangle(uint32_t f, const std::vector<uint8_t> &excluded,
+                       Accept &accept, uint64_t &budget, bool &exhausted) const {
+        Box box;
+        for (int k = 0; k < 3; ++k) box.add(uv + 2*size_t(faces[3*size_t(f)+k]));
+        return nodes.empty() || queryNode(0,f,box,excluded,accept,budget,exhausted);
+    }
+    void refit(const std::vector<uint32_t> &changed) {
+        for (uint32_t f : changed) {
+            boxes[f] = Box();
+            for (int k = 0; k < 3; ++k) boxes[f].add(uv + 2*size_t(faces[3*size_t(f)+k]));
+        }
+        for (uint32_t f : changed) {
+            uint32_t id = faceLeaf[f];
+            nodes[id].box = Box();
+            for (uint32_t i = nodes[id].begin; i < nodes[id].end; ++i) nodes[id].box.add(boxes[order[i]]);
+            while (nodes[id].parent != UINT32_MAX) {
+                id = nodes[id].parent;
+                nodes[id].box = Box();
+                nodes[id].box.add(nodes[nodes[id].left].box);
+                nodes[id].box.add(nodes[nodes[id].right].box);
+            }
+        }
+    }
     Validation run(uint32_t vertexCount, uint32_t faceCount) {
         auto start = Clock::now(); Validation result;
         if (prepare(vertexCount, faceCount, result) && faceCount) visit(0, 0, result);
@@ -279,28 +345,554 @@ struct UnionFind {
     void join(int a, int b) { a=root(a); b=root(b); if(a==b)return; if(p[a]>p[b])std::swap(a,b); p[a]+=p[b]; p[b]=a; }
 };
 
-struct OverlapSplit {
+struct OverlapFix {
     std::vector<int32_t> groups;
     uint32_t chartCount = 1;
     uint32_t overlapFaces = 0;
     uint64_t overlapPairs = 0;
     uint64_t candidates = 0;
+    uint32_t inputIslands = 0;
+    uint32_t inputUndersized = 0;
+    uint32_t outputUndersized = 0;
+    uint32_t transferredFaces = 0;
+    uint32_t inputSingletons = 0, outputSingletons = 0, blockedSingletons = 0;
+    uint64_t remainingPairs = 0, repairAttempts = 0, repairedTriangles = 0, movedVariables = 0;
+    uint64_t fanSkips = 0, budgetSkips = 0, repairWork = 0;
+    double detectionSeconds = 0, repairSeconds = 0, partitionSeconds = 0;
     bool valid = true;
     bool limited = false;
 };
 
-// Split a UV mesh into conflict-free face groups. Group zero is the original
-// chart; each additional group is packed independently by xatlas. In the
-// usual two-layer projection case, one connected overlap component therefore
-// creates exactly one additional chart. More groups are used only when the
-// overlap graph cannot be colored with two groups.
-inline OverlapSplit splitOverlappingUvFaces(
-    const float *uv,
+struct UvFaceGraph {
+    std::vector<uint32_t> offsets, neighbors;
+    std::vector<double> lengths;
+};
+
+// Match geometry AND UV endpoints, including aliases with different source
+// indices. A UV seam or point contact must not join two surface patches.
+inline std::vector<uint32_t> uvVariables(const float *uv, uint32_t vertexCount,
+                                         const int64_t *vertexIds) {
+    std::vector<uint32_t> vertices(vertexCount), order(vertexCount);
+    std::iota(order.begin(), order.end(), 0);
+    if (vertexIds) {
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            if (vertexIds[a] != vertexIds[b]) return vertexIds[a] < vertexIds[b];
+            if (uv[2*size_t(a)] != uv[2*size_t(b)]) return uv[2*size_t(a)] < uv[2*size_t(b)];
+            if (uv[2*size_t(a)+1] != uv[2*size_t(b)+1]) return uv[2*size_t(a)+1] < uv[2*size_t(b)+1];
+            return a < b;
+        });
+    }
+    uint32_t canonical = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        uint32_t v = order[i];
+        if (i) {
+            uint32_t p = order[i-1];
+            if (!vertexIds || vertexIds[p] != vertexIds[v] ||
+                uv[2*size_t(p)] != uv[2*size_t(v)] || uv[2*size_t(p)+1] != uv[2*size_t(v)+1]) ++canonical;
+        }
+        vertices[v] = canonical;
+    }
+    return vertices;
+}
+
+inline UvFaceGraph uvFaceGraph(const float *uv, const int32_t *faces,
+                              uint32_t vertexCount, uint32_t faceCount,
+                              const int64_t *vertexIds,
+                              const std::vector<uint32_t> *fixedVariables = nullptr) {
+    const auto vertices = fixedVariables ? *fixedVariables : uvVariables(uv,vertexCount,vertexIds);
+    struct EdgeRef { uint64_t key; uint32_t face; double length; };
+    std::vector<EdgeRef> edges;
+    edges.reserve(size_t(faceCount)*3);
+    for (uint32_t f = 0; f < faceCount; ++f) for (uint32_t k = 0; k < 3; ++k) {
+        uint32_t a = uint32_t(faces[3*size_t(f)+k]);
+        uint32_t b = uint32_t(faces[3*size_t(f)+(k+1)%3]);
+        uint32_t x = vertices[a], y = vertices[b];
+        if (x == y) continue;
+        const uint64_t key = (uint64_t(std::min(x,y)) << 32) | std::max(x,y);
+        double dx = double(uv[2*size_t(a)])-uv[2*size_t(b)];
+        double dy = double(uv[2*size_t(a)+1])-uv[2*size_t(b)+1];
+        edges.push_back({key, f, std::sqrt(dx*dx+dy*dy)});
+    }
+    std::sort(edges.begin(), edges.end(), [](const EdgeRef &a, const EdgeRef &b) {
+        return a.key != b.key ? a.key < b.key : a.face < b.face;
+    });
+    UvFaceGraph graph;
+    graph.offsets.assign(size_t(faceCount)+1, 0);
+    // A star keeps non-manifold edges linear in their number of incidences.
+    for (size_t start = 0, end; start < edges.size(); start = end) {
+        for (end = start+1; end < edges.size() && edges[end].key == edges[start].key; ++end) {}
+        for (size_t i = start+1; i < end; ++i) if (edges[i].face != edges[i-1].face) {
+            ++graph.offsets[edges[start].face+1]; ++graph.offsets[edges[i].face+1];
+        }
+    }
+    for (size_t i = 1; i < graph.offsets.size(); ++i) graph.offsets[i] += graph.offsets[i-1];
+    graph.neighbors.resize(graph.offsets.back());
+    graph.lengths.resize(graph.offsets.back());
+    auto cursor = graph.offsets;
+    for (size_t start = 0, end; start < edges.size(); start = end) {
+        for (end = start+1; end < edges.size() && edges[end].key == edges[start].key; ++end) {}
+        for (size_t i = start+1; i < end; ++i) if (edges[i].face != edges[i-1].face) {
+            const uint32_t a = edges[start].face, b = edges[i].face;
+            uint32_t p = cursor[a]++, q = cursor[b]++;
+            graph.neighbors[p] = b; graph.neighbors[q] = a;
+            graph.lengths[p] = graph.lengths[q] = edges[start].length;
+        }
+    }
+    return graph;
+}
+
+// A bounded local edit, using the same BVH and conflict graph as partitioning.
+// An accepted edit may only DELETE conflicts, never create a new pair.
+class LocalUvUntangler {
+    static constexpr uint32_t maxFan = 12;
+    float *uv;
+    const int32_t *faces;
+    const std::vector<uint32_t> &variables;
+    const UvFaceGraph &graph;
+    Validator &validator;
+    OverlapFix &stats;
+    const std::vector<std::pair<uint32_t,uint32_t>> &pairs;
+    std::vector<std::vector<uint32_t>> aliases, fans;
+    std::vector<uint32_t> pairOffsets, pairIds, degree;
+    std::vector<uint8_t> live, affected, visits, pending, repaired, moved;
+    std::unordered_map<uint64_t,uint32_t> pairIndex;
+    std::queue<uint32_t> queue;
+    uint64_t workLeft;
+    static uint64_t pairKey(uint32_t a, uint32_t b) {
+        return (uint64_t(std::min(a,b)) << 32) | std::max(a,b);
+    }
+    bool existing(uint32_t a, uint32_t b) const {
+        auto it = pairIndex.find(pairKey(a,b));
+        return it != pairIndex.end() && live[it->second];
+    }
+    void enqueue(uint32_t f) {
+        if (degree[f] && visits[f] < 2 && !pending[f]) { pending[f] = 1; queue.push(f); }
+    }
+    bool anchored(uint32_t f, int corner) const {
+        uint32_t v = variables[uint32_t(faces[3*size_t(f)+corner])];
+        uint32_t a = variables[uint32_t(faces[3*size_t(f)+(corner+1)%3])];
+        uint32_t b = variables[uint32_t(faces[3*size_t(f)+(corner+2)%3])];
+        for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) {
+            bool hasA = false, hasB = false, hasV = false;
+            for (int k = 0; k < 3; ++k) {
+                uint32_t x = variables[uint32_t(faces[3*size_t(graph.neighbors[i])+k])];
+                hasA |= x == a; hasB |= x == b; hasV |= x == v;
+            }
+            if (hasA && hasB && !hasV) return true;
+        }
+        return false;
+    }
+    bool tryCorner(uint32_t seed, int corner) {
+        uint32_t v = variables[uint32_t(faces[3*size_t(seed)+corner])];
+        if (fans[v].size() > maxFan) { ++stats.fanSkips; return false; }
+        if (!anchored(seed,corner)) return false;
+        const float *a = uv + 2*size_t(faces[3*size_t(seed)+(corner+1)%3]);
+        const float *b = uv + 2*size_t(faces[3*size_t(seed)+(corner+2)%3]);
+        const uint32_t representative = aliases[v][0];
+        const std::array<float,2> old{{uv[2*size_t(representative)],uv[2*size_t(representative)+1]}};
+        const double dx = double(b[0])-a[0], dy = double(b[1])-a[1];
+        const double length2 = dx*dx+dy*dy;
+        if (!(length2 > 0)) return false;
+        const double t = ((double(old[0])-a[0])*dx+(double(old[1])-a[1])*dy)/length2;
+        const double foot[2] = {a[0]+t*dx,a[1]+t*dy};
+        auto set = [&](float x,float y) {
+            for (uint32_t alias : aliases[v]) { uv[2*size_t(alias)] = x; uv[2*size_t(alias)+1] = y; }
+        };
+        for (uint32_t f : fans[v]) affected[f] = 1;
+        bool accepted = false;
+        for (double height : {1.0,0.5}) {
+            if (!workLeft) { ++stats.budgetSkips; break; }
+            ++stats.repairAttempts;
+            // First reflect the apex, then try a shorter reflected altitude.
+            // Cast BEFORE predicates: the stored float32 layout is what matters.
+            set(float(foot[0]+height*(foot[0]-old[0])),float(foot[1]+height*(foot[1]-old[1])));
+            bool good = true, exhausted = false;
+            for (uint32_t f : fans[v]) if (!validator.usableTriangle(f)) { good = false; break; }
+            auto allow = [&](uint32_t f,uint32_t g) {
+                return f != seed && g != seed && existing(f,g);
+            };
+            for (size_t i = 0; good && i < fans[v].size(); ++i) {
+                uint32_t f = fans[v][i];
+                good = validator.queryTriangle(f,affected,allow,workLeft,exhausted);
+                for (size_t j = i+1; good && j < fans[v].size(); ++j) {
+                    if (!workLeft) { exhausted = true; good = false; break; }
+                    --workLeft;
+                    uint32_t g = fans[v][j];
+                    if (validator.overlaps(f,g) && !allow(f,g)) good = false;
+                }
+            }
+            std::vector<uint32_t> resolved;
+            // Charge graph maintenance to the same budget before committing.
+            // Dense conflict fans cannot bypass the spatial-query work cap.
+            for (uint32_t f : fans[v]) {
+                if (!good) break;
+                for (uint32_t i = pairOffsets[f]; i < pairOffsets[f+1]; ++i) {
+                    if (!workLeft) { exhausted = true; good = false; break; }
+                    --workLeft;
+                    uint32_t id = pairIds[i];
+                    if (live[id] && !validator.overlaps(pairs[id].first,pairs[id].second)) resolved.push_back(id);
+                }
+            }
+            if (exhausted) ++stats.budgetSkips;
+            if (!good) { set(old[0],old[1]); continue; }
+            // Every overlap of seed has gone, so the active graph strictly shrinks.
+            for (uint32_t id : resolved) if (live[id]) {
+                uint32_t x = pairs[id].first, y = pairs[id].second;
+                live[id] = 0; --degree[x]; --degree[y];
+                for (uint32_t f : {x,y}) {
+                    if (!degree[f] && !repaired[f]) { repaired[f] = 1; ++stats.repairedTriangles; }
+                    enqueue(f);
+                }
+            }
+            validator.refit(fans[v]);
+            if (!moved[v]) { moved[v] = 1; ++stats.movedVariables; }
+            for (uint32_t f : fans[v]) {
+                enqueue(f);
+                for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) enqueue(graph.neighbors[i]);
+            }
+            accepted = true; break;
+        }
+        for (uint32_t f : fans[v]) affected[f] = 0;
+        return accepted;
+    }
+public:
+    LocalUvUntangler(float *coordinates, const int32_t *triangles,
+                     const std::vector<uint32_t> &vertexVariables, const UvFaceGraph &adjacency,
+                     Validator &index, const std::vector<std::pair<uint32_t,uint32_t>> &overlaps,
+                     uint32_t faceCount, OverlapFix &result)
+        : uv(coordinates), faces(triangles), variables(vertexVariables), graph(adjacency),
+          validator(index), stats(result), pairs(overlaps), degree(faceCount,0),
+          live(overlaps.size(),1), affected(faceCount,0), visits(faceCount,0),
+          pending(faceCount,0), repaired(faceCount,0), workLeft(0) {
+        uint32_t count = variables.empty() ? 0 : *std::max_element(variables.begin(),variables.end())+1;
+        aliases.resize(count); fans.resize(count); moved.assign(count,0);
+        for (uint32_t v = 0; v < variables.size(); ++v) aliases[variables[v]].push_back(v);
+        for (uint32_t f = 0; f < faceCount; ++f)
+            for (int k = 0; k < 3; ++k) fans[variables[uint32_t(faces[3*size_t(f)+k])]].push_back(f);
+        pairOffsets.assign(size_t(faceCount)+1,0);
+        pairIndex.reserve(pairs.size());
+        for (uint32_t id = 0; id < pairs.size(); ++id) {
+            const auto &p = pairs[id];
+            ++degree[p.first]; ++degree[p.second];
+            ++pairOffsets[p.first+1]; ++pairOffsets[p.second+1];
+            pairIndex.emplace(pairKey(p.first,p.second),id);
+        }
+        for (size_t i = 1; i < pairOffsets.size(); ++i) pairOffsets[i] += pairOffsets[i-1];
+        auto cursor = pairOffsets; pairIds.resize(pairs.size()*2);
+        for (uint32_t id = 0; id < pairs.size(); ++id) {
+            pairIds[cursor[pairs[id].first]++] = id; pairIds[cursor[pairs[id].second]++] = id;
+        }
+    }
+    std::vector<std::pair<uint32_t,uint32_t>> run(uint64_t budgetLimit = 8'000'000) {
+        std::vector<uint32_t> seeds;
+        for (uint32_t f = 0; f < degree.size(); ++f) if (degree[f]) seeds.push_back(f);
+        auto smallestFan = [&](uint32_t f) {
+            size_t n = std::numeric_limits<size_t>::max();
+            for (int k = 0; k < 3; ++k) n = std::min(n,fans[variables[uint32_t(faces[3*size_t(f)+k])]].size());
+            return n;
+        };
+        std::sort(seeds.begin(),seeds.end(),[&](uint32_t a,uint32_t b) {
+            size_t x = smallestFan(a), y = smallestFan(b);
+            if (x != y) return x < y;
+            return degree[a] != degree[b] ? degree[a] < degree[b] : a < b;
+        });
+        // Bound query work per chart as well as positions/visits per face.
+        const uint64_t budget = std::min<uint64_t>(budgetLimit,4096+512*uint64_t(seeds.size()));
+        workLeft = budget;
+        for (uint32_t f : seeds) enqueue(f);
+        while (!queue.empty()) {
+            uint32_t f = queue.front(); queue.pop(); pending[f] = 0;
+            if (!degree[f]) continue;
+            if (!workLeft) { ++stats.budgetSkips; continue; }
+            ++visits[f];
+            std::array<int,3> corners{{0,1,2}};
+            std::stable_sort(corners.begin(),corners.end(),[&](int a,int b) {
+                return fans[variables[uint32_t(faces[3*size_t(f)+a])]].size()
+                     < fans[variables[uint32_t(faces[3*size_t(f)+b])]].size();
+            });
+            for (int corner : corners) if (tryCorner(f,corner)) break;
+        }
+        stats.repairWork = budget-workLeft;
+        std::vector<std::pair<uint32_t,uint32_t>> remaining;
+        for (size_t i = 0; i < pairs.size(); ++i) if (live[i]) remaining.push_back(pairs[i]);
+        return remaining;
+    }
+};
+
+// One partitioner for all flatteners: simultaneous connected growth followed
+// by a single, leaf-only boundary-balancing pass. Coordinates never change.
+class ConnectedUvPatches {
+    struct Frontier {
+        double support;
+        uint32_t face, parent, remaining;
+        bool operator<(const Frontier &b) const {
+            if (remaining != b.remaining) return remaining > b.remaining;
+            if (support != b.support) return support < b.support;
+            if (face != b.face) return face > b.face;
+            return parent > b.parent;
+        }
+    };
+    struct Patch {
+        uint32_t size = 0;
+        uint64_t version = 0;
+        std::priority_queue<Frontier> frontier;
+    };
+    struct Scheduled {
+        bool small;
+        uint32_t size, group;
+        double support;
+        uint64_t version;
+        bool operator<(const Scheduled &b) const {
+            if (small != b.small) return small < b.small;
+            if (small && size != b.size) return size > b.size;
+            if (support != b.support) return support < b.support;
+            return group > b.group;
+        }
+    };
+    const UvFaceGraph &graph;
+    uint32_t minimum;
+    std::vector<uint32_t> conflictOffsets, conflicts, children, unassignedNeighbors;
+    std::vector<uint8_t> compatibleEdge;
+    std::vector<int32_t> labels, parent;
+    std::vector<Patch> patches;
+    std::priority_queue<Scheduled> scheduled;
+    // Counts permit O(1) eligibility checks, including after boundary moves.
+    std::unordered_map<uint64_t, uint32_t> blocked;
+    std::unordered_map<uint64_t, double> support;
+    std::unordered_map<uint64_t, Frontier> deferred;
+    std::vector<std::vector<uint64_t>> wakeOnAssignment;
+    static uint64_t key(uint32_t face, uint32_t group) { return (uint64_t(face) << 32) | group; }
+    bool isBlocked(uint32_t f, uint32_t g) const { return blocked.find(key(f,g)) != blocked.end(); }
+    uint32_t strandedNeighbor(uint32_t f, uint32_t g) const {
+        for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) {
+            uint32_t n = graph.neighbors[i];
+            if (compatibleEdge[i] && labels[n] < 0 && unassignedNeighbors[n] == 1 && isBlocked(n,g))
+                return n;
+        }
+        return UINT32_MAX;
+    }
+    void updateBlocks(uint32_t f, uint32_t g, bool add) {
+        for (uint32_t i = conflictOffsets[f]; i < conflictOffsets[f+1]; ++i) {
+            const uint64_t k = key(conflicts[i],g);
+            if (add) ++blocked[k];
+            else {
+                auto it = blocked.find(k);
+                if (it != blocked.end() && --it->second == 0) blocked.erase(it);
+            }
+        }
+    }
+    void assign(uint32_t f, uint32_t g, int32_t from) {
+        labels[f] = int32_t(g); parent[f] = from;
+        if (from >= 0) ++children[uint32_t(from)];
+        ++patches[g].size;
+        updateBlocks(f,g,true);
+        for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) {
+            uint32_t n = graph.neighbors[i];
+            if (labels[n] < 0 && compatibleEdge[i]) --unassignedNeighbors[n];
+            if (labels[n] >= 0 || isBlocked(n,g)) continue;
+            double weight = (support[key(n,g)] += graph.lengths[i]);
+            patches[g].frontier.push({weight,n,f,unassignedNeighbors[n]});
+        }
+        // A reserved connector may become eligible when its blocked neighbor
+        // joins another patch. Wake it locally instead of seeding a new island.
+        for (uint64_t k : wakeOnAssignment[f]) {
+            auto it = deferred.find(k);
+            if (it == deferred.end()) continue;
+            auto entry = it->second; uint32_t receiver = uint32_t(k);
+            deferred.erase(it);
+            if (labels[entry.face] >= 0 || isBlocked(entry.face,receiver)) continue;
+            entry.support = support.at(k); entry.remaining = unassignedNeighbors[entry.face];
+            patches[receiver].frontier.push(entry); schedule(receiver);
+        }
+        wakeOnAssignment[f].clear();
+    }
+    void clean(uint32_t g) {
+        auto &frontier = patches[g].frontier;
+        while (!frontier.empty()) {
+            auto entry = frontier.top();
+            if (labels[entry.face] < 0 && !isBlocked(entry.face,g) &&
+                support.at(key(entry.face,g)) == entry.support) {
+                uint32_t stranded = strandedNeighbor(entry.face,g);
+                if (stranded != UINT32_MAX) {
+                    uint64_t k = key(entry.face,g);
+                    if (deferred.emplace(k,entry).second) wakeOnAssignment[stranded].push_back(k);
+                    frontier.pop(); continue;
+                }
+                if (entry.remaining == unassignedNeighbors[entry.face]) break;
+                frontier.pop(); entry.remaining = unassignedNeighbors[entry.face]; frontier.push(entry);
+                continue;
+            }
+            frontier.pop();
+        }
+    }
+    void schedule(uint32_t g) {
+        clean(g);
+        auto &patch = patches[g];
+        ++patch.version;
+        if (!patch.frontier.empty()) scheduled.push({patch.size < minimum, patch.size,
+            g, patch.frontier.top().support, patch.version});
+    }
+    uint32_t seed(uint32_t f) {
+        uint32_t g = uint32_t(patches.size());
+        patches.emplace_back();
+        assign(f,g,-1);
+        schedule(g);
+        return g;
+    }
+    void grow() {
+        while (!scheduled.empty()) {
+            const auto item = scheduled.top(); scheduled.pop();
+            if (item.version != patches[item.group].version) continue;
+            clean(item.group);
+            auto &frontier = patches[item.group].frontier;
+            if (frontier.empty()) continue;
+            if (frontier.top().support != item.support) { schedule(item.group); continue; }
+            auto entry = frontier.top(); frontier.pop();
+            assign(entry.face,item.group,int32_t(entry.parent));
+            schedule(item.group);
+        }
+    }
+    uint32_t balance() {
+        if (minimum <= 1) return 0;
+        std::queue<uint32_t> leaves;
+        std::vector<uint8_t> moved(labels.size(), 0);
+        for (uint32_t f = 0; f < labels.size(); ++f)
+            if (!children[f] && parent[f] >= 0 && patches[uint32_t(labels[f])].size > minimum) leaves.push(f);
+        uint32_t transfers = 0;
+        while (!leaves.empty()) {
+            uint32_t f = leaves.front(); leaves.pop();
+            uint32_t donor = uint32_t(labels[f]);
+            if (moved[f] || children[f] || parent[f] < 0 || patches[donor].size <= minimum) continue;
+            int32_t receiver = -1, attach = -1;
+            double best = -1;
+            for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) {
+                uint32_t n = graph.neighbors[i], g = uint32_t(labels[n]);
+                if (g == donor || patches[g].size >= minimum || isBlocked(f,g)) continue;
+                if (receiver < 0 || patches[g].size < patches[uint32_t(receiver)].size ||
+                    (patches[g].size == patches[uint32_t(receiver)].size && graph.lengths[i] > best)) {
+                    receiver = int32_t(g); attach = int32_t(n); best = graph.lengths[i];
+                }
+            }
+            if (receiver < 0) continue;
+            // A leaf can be removed without disconnecting its donor. Attaching
+            // it through a shared edge preserves the receiver's spanning tree.
+            int32_t oldParent = parent[f];
+            if (oldParent >= 0 && --children[uint32_t(oldParent)] == 0) leaves.push(uint32_t(oldParent));
+            updateBlocks(f,donor,false);
+            updateBlocks(f,uint32_t(receiver),true);
+            --patches[donor].size; ++patches[uint32_t(receiver)].size;
+            labels[f] = receiver; parent[f] = attach; ++children[uint32_t(attach)];
+            moved[f] = 1; ++transfers;
+        }
+        return transfers;
+    }
+public:
+    ConnectedUvPatches(const UvFaceGraph &adjacency, uint32_t faceCount,
+                       const std::vector<std::pair<uint32_t,uint32_t>> &pairs,
+                       uint32_t target)
+        : graph(adjacency), minimum(std::max(1u,target)), children(faceCount,0),
+          labels(faceCount,-1), parent(faceCount,-1), wakeOnAssignment(faceCount) {
+        conflictOffsets.assign(size_t(faceCount)+1,0);
+        for (const auto &pair : pairs) { ++conflictOffsets[pair.first+1]; ++conflictOffsets[pair.second+1]; }
+        for (size_t i = 1; i < conflictOffsets.size(); ++i) conflictOffsets[i] += conflictOffsets[i-1];
+        auto cursor = conflictOffsets;
+        conflicts.resize(pairs.size()*2);
+        for (const auto &pair : pairs) {
+            conflicts[cursor[pair.first]++] = pair.second;
+            conflicts[cursor[pair.second]++] = pair.first;
+        }
+        // Sorted conflict rows make compatibility tests cheap without a second
+        // hash table proportional to all overlap pairs.
+        for (uint32_t f = 0; f < faceCount; ++f)
+            std::sort(conflicts.begin()+conflictOffsets[f],conflicts.begin()+conflictOffsets[f+1]);
+        unassignedNeighbors.assign(faceCount,0); compatibleEdge.resize(graph.neighbors.size());
+        for (uint32_t f = 0; f < faceCount; ++f)
+            for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) {
+                bool compatible = !std::binary_search(conflicts.begin()+conflictOffsets[f],
+                    conflicts.begin()+conflictOffsets[f+1],graph.neighbors[i]);
+                compatibleEdge[i] = uint8_t(compatible);
+                unassignedNeighbors[f] += uint32_t(compatible);
+            }
+    }
+    void run(OverlapFix &result, bool limited = false) {
+        const uint32_t count = uint32_t(labels.size());
+        UnionFind connected{int(count)};
+        for (uint32_t f = 0; f < count; ++f)
+            for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) connected.join(int(f),int(graph.neighbors[i]));
+        std::vector<int32_t> componentId(count,-1);
+        std::vector<std::vector<uint32_t>> components;
+        for (uint32_t f = 0; f < count; ++f) {
+            int root = connected.root(int(f));
+            if (componentId[uint32_t(root)] < 0) {
+                componentId[uint32_t(root)] = int32_t(components.size()); components.emplace_back();
+            }
+            components[size_t(componentId[uint32_t(root)])].push_back(f);
+        }
+        result.inputIslands = uint32_t(components.size());
+        for (const auto &component : components) if (component.size() == 1) ++result.inputSingletons;
+        for (const auto &component : components) if (component.size() < minimum) ++result.inputUndersized;
+        if (limited) {
+            // Retain the existing dense-graph safety limit. Allocate before
+            // writing: the previous safeguard indexed an empty groups vector.
+            result.groups.resize(count);
+            std::iota(result.groups.begin(),result.groups.end(),0);
+            result.chartCount = count;
+            result.outputSingletons = count;
+            result.outputUndersized = minimum > 1 ? count : 0;
+            return;
+        }
+        auto degree = [&](uint32_t f) { return conflictOffsets[f+1]-conflictOffsets[f]; };
+        for (auto &component : components) {
+            uint32_t first = component[0];
+            for (uint32_t f : component) if (degree(f) > degree(first)) first = f;
+            int32_t second = -1;
+            // Cross-component overlap pairs need no cut: the surface islands
+            // already become separate patches.
+            for (uint32_t f : component) for (uint32_t i = conflictOffsets[f]; i < conflictOffsets[f+1]; ++i) {
+                uint32_t n = conflicts[i];
+                if (connected.root(int(f)) != connected.root(int(n))) continue;
+                if (second < 0 || degree(f) > degree(first) ||
+                    (degree(f) == degree(first) && degree(n) > degree(uint32_t(second)))) {
+                    first = f; second = int32_t(n);
+                }
+            }
+            if (second < 0) {
+                // Whole-component fast path. No queues or sparse blocking
+                // entries are needed for an overlap-free surface island.
+                uint32_t g = uint32_t(patches.size()); patches.emplace_back();
+                patches[g].size = uint32_t(component.size());
+                for (uint32_t f : component) labels[f] = int32_t(g);
+                continue;
+            }
+            std::sort(component.begin(),component.end(),[&](uint32_t a,uint32_t b) {
+                return degree(a) != degree(b) ? degree(a) > degree(b) : a < b;
+            });
+            seed(first); seed(uint32_t(second));
+            grow();
+            for (uint32_t f : component) if (labels[f] < 0) { seed(f); grow(); }
+        }
+        result.transferredFaces = balance();
+        result.groups = std::move(labels);
+        result.chartCount = uint32_t(patches.size());
+        for (const auto &patch : patches) if (patch.size < minimum) ++result.outputUndersized;
+        for (uint32_t f = 0; f < count; ++f) if (patches[uint32_t(result.groups[f])].size == 1) {
+            ++result.outputSingletons;
+            bool compatible = false;
+            for (uint32_t i = graph.offsets[f]; i < graph.offsets[f+1]; ++i) compatible |= bool(compatibleEdge[i]);
+            if (!compatible) ++result.blockedSingletons;
+        }
+    }
+};
+
+inline OverlapFix fixOverlappingUvFaces(
+    float *uv,
     const int32_t *faces,
     uint32_t vertexCount,
-    uint32_t faceCount
+    uint32_t faceCount,
+    const int64_t *vertexIds = nullptr,
+    uint32_t minimum = 0
 ) {
-    OverlapSplit result;
+    OverlapFix result;
     if (!faceCount) return result;
 
     std::vector<std::pair<uint32_t, uint32_t>> pairs;
@@ -310,106 +902,40 @@ inline OverlapSplit splitOverlappingUvFaces(
     constexpr uint64_t maxPairs = 4'000'000;
     Validation validation;
     Validator validator(uv, faces);
+    auto started = Clock::now();
     const bool complete = validator.collectOverlaps(
         vertexCount, faceCount, pairs, result.candidates, maxPairs, validation
     );
+    result.detectionSeconds = seconds(started);
     if (!validation.issue && !complete) {
         result.limited = true;
         result.overlapPairs = pairs.size();
         result.overlapFaces = faceCount;
-        result.chartCount = faceCount;
-        for (uint32_t f = 0; f < faceCount; ++f) result.groups[f] = int32_t(f);
-        return result;
     }
     if (validation.issue) {
         result.valid = false;
         return result;
     }
-    result.overlapPairs = pairs.size();
-    if (pairs.empty()) return result;
-
-    result.groups.assign(faceCount, 0);
-
     std::vector<uint32_t> degree(faceCount, 0);
-    UnionFind components{int(faceCount)};
     for (const auto &pair : pairs) {
         ++degree[pair.first]; ++degree[pair.second];
-        components.join(int(pair.first), int(pair.second));
     }
-    for (uint32_t f = 0; f < faceCount; ++f)
-        if (degree[f]) ++result.overlapFaces;
-
-    std::vector<uint32_t> offsets(size_t(faceCount) + 1, 0);
-    for (uint32_t f = 0; f < faceCount; ++f) offsets[f + 1] = offsets[f] + degree[f];
-    std::vector<uint32_t> cursor = offsets;
-    std::vector<uint32_t> neighbors(size_t(pairs.size()) * 2);
-    for (const auto &pair : pairs) {
-        neighbors[cursor[pair.first]++] = pair.second;
-        neighbors[cursor[pair.second]++] = pair.first;
+    result.overlapPairs = pairs.size();
+    if (!result.limited) for (uint32_t f = 0; f < faceCount; ++f) if (degree[f]) ++result.overlapFaces;
+    const auto variables = uvVariables(uv,vertexCount,vertexIds);
+    auto graph = uvFaceGraph(uv,faces,vertexCount,faceCount,vertexIds,&variables);
+    started = Clock::now();
+    if (!pairs.empty() && !result.limited) {
+        LocalUvUntangler repair(uv,faces,variables,graph,validator,pairs,faceCount,result);
+        pairs = repair.run();
+        graph = uvFaceGraph(uv,faces,vertexCount,faceCount,vertexIds,&variables);
     }
-
-    std::vector<int32_t> componentId(faceCount, -1);
-    std::vector<std::vector<uint32_t>> componentFaces;
-    for (uint32_t f = 0; f < faceCount; ++f) if (degree[f]) {
-        int root = components.root(int(f));
-        if (componentId[root] < 0) {
-            componentId[root] = int32_t(componentFaces.size());
-            componentFaces.emplace_back();
-        }
-        componentFaces[componentId[root]].push_back(f);
-    }
-
-    std::vector<int32_t> colors(faceCount, -1);
-    std::vector<int32_t> marks(faceCount, -1);
-    uint32_t nextGroup = 1;
-    for (const auto &component : componentFaces) {
-        bool bipartite = true;
-        std::vector<uint32_t> queue;
-        queue.reserve(component.size());
-        for (uint32_t seed : component) if (colors[seed] < 0) {
-            colors[seed] = 0; queue.push_back(seed);
-            for (size_t q = 0; q < queue.size(); ++q) {
-                uint32_t f = queue[q];
-                for (uint32_t n = offsets[f]; n < offsets[f + 1]; ++n) {
-                    uint32_t other = neighbors[n];
-                    if (colors[other] < 0) {
-                        colors[other] = 1 - colors[f]; queue.push_back(other);
-                    } else if (colors[other] == colors[f]) {
-                        bipartite = false;
-                    }
-                }
-            }
-        }
-
-        int32_t colorCount = 2;
-        if (!bipartite) {
-            for (uint32_t f : component) colors[f] = -1;
-            colorCount = 0;
-            for (uint32_t f : component) {
-                for (uint32_t n = offsets[f]; n < offsets[f + 1]; ++n) {
-                    int32_t color = colors[neighbors[n]];
-                    if (color >= 0) marks[color] = int32_t(f);
-                }
-                int32_t color = 0;
-                while (color < int32_t(marks.size()) && marks[color] == int32_t(f)) ++color;
-                colors[f] = color;
-                colorCount = std::max(colorCount, color + 1);
-            }
-        }
-
-        std::vector<uint32_t> colorSizes(size_t(colorCount), 0);
-        for (uint32_t f : component) ++colorSizes[colors[f]];
-        int32_t baseColor = 0;
-        for (int32_t color = 1; color < colorCount; ++color)
-            if (colorSizes[color] > colorSizes[baseColor]) baseColor = color;
-
-        std::vector<int32_t> colorGroups(size_t(colorCount), -1);
-        colorGroups[baseColor] = 0;
-        for (int32_t color = 0; color < colorCount; ++color)
-            if (color != baseColor) colorGroups[color] = int32_t(nextGroup++);
-        for (uint32_t f : component) result.groups[f] = colorGroups[colors[f]];
-    }
-    result.chartCount = nextGroup;
+    result.repairSeconds = seconds(started);
+    result.remainingPairs = pairs.size();
+    started = Clock::now();
+    ConnectedUvPatches partitioner(graph,faceCount,pairs,minimum);
+    partitioner.run(result,result.limited);
+    result.partitionSeconds = seconds(started);
     return result;
 }
 

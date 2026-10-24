@@ -122,40 +122,73 @@ public:
         return result;
     }
 
-    static py::tuple SplitUvOverlaps(const torch::Tensor &uv, const torch::Tensor &faces) {
+    static py::tuple FixUvOverlaps(const torch::Tensor &uv, const torch::Tensor &faces,
+                                  const std::optional<torch::Tensor> &vertex_ids,
+                                  int64_t min_island_triangles) {
         check_tensor(uv, "uv", torch::kFloat32);
         check_tensor(faces, "faces", torch::kInt32);
         TORCH_CHECK(uv.dim()==2 && uv.size(1)==2, "uv must have shape [V,2]");
         TORCH_CHECK(faces.dim()==2 && faces.size(1)==3, "faces must have shape [F,3]");
         TORCH_CHECK(uv.size(0)<=std::numeric_limits<uint32_t>::max() &&
-                    faces.size(0)<=std::numeric_limits<uint32_t>::max(),
+                    faces.size(0)<=std::numeric_limits<int32_t>::max(),
                     "UV mesh too large");
+        TORCH_CHECK(min_island_triangles >= 0 && min_island_triangles <= std::numeric_limits<int32_t>::max(),
+                    "min_island_triangles must be between 0 and int32 max");
+        if (vertex_ids) {
+            check_tensor(*vertex_ids, "vertex_ids", torch::kInt64);
+            TORCH_CHECK(vertex_ids->dim() == 1 && vertex_ids->size(0) == uv.size(0),
+                        "vertex_ids must have shape [V]");
+        }
 
-        cumesh_xatlas::safeuv::OverlapSplit split;
+        auto fixedUv = uv.clone();
+        cumesh_xatlas::safeuv::OverlapFix fix;
         {
             py::gil_scoped_release release;
-            split = cumesh_xatlas::safeuv::splitOverlappingUvFaces(
-                uv.data_ptr<float>(), faces.data_ptr<int32_t>(),
-                uint32_t(uv.size(0)), uint32_t(faces.size(0))
+            fix = cumesh_xatlas::safeuv::fixOverlappingUvFaces(
+                fixedUv.data_ptr<float>(), faces.data_ptr<int32_t>(),
+                uint32_t(uv.size(0)), uint32_t(faces.size(0)),
+                vertex_ids ? vertex_ids->data_ptr<int64_t>() : nullptr,
+                uint32_t(min_island_triangles)
             );
         }
         auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
         torch::Tensor groups;
-        if (split.groups.empty()) {
+        if (fix.groups.empty()) {
             groups = torch::empty({0}, options);
         } else {
             groups = torch::from_blob(
-                split.groups.data(), {int64_t(split.groups.size())}, options
+                fix.groups.data(), {int64_t(fix.groups.size())}, options
             ).clone();
         }
+        py::dict stats;
+        stats["islands_before"] = fix.inputIslands;
+        stats["islands_after"] = fix.chartCount;
+        stats["undersized_before"] = fix.inputUndersized;
+        stats["undersized_after"] = fix.outputUndersized;
+        stats["singletons_before"] = fix.inputSingletons;
+        stats["singletons_after"] = fix.outputSingletons;
+        stats["blocked_singletons"] = fix.blockedSingletons;
+        stats["transferred_faces"] = fix.transferredFaces;
+        stats["remaining_pairs"] = fix.remainingPairs;
+        stats["repair_attempts"] = fix.repairAttempts;
+        stats["repaired_triangles"] = fix.repairedTriangles;
+        stats["moved_variables"] = fix.movedVariables;
+        stats["fan_skips"] = fix.fanSkips;
+        stats["budget_skips"] = fix.budgetSkips;
+        stats["repair_work"] = fix.repairWork;
+        stats["detection_seconds"] = fix.detectionSeconds;
+        stats["repair_seconds"] = fix.repairSeconds;
+        stats["partition_seconds"] = fix.partitionSeconds;
         return py::make_tuple(
+            fixedUv,
             groups,
-            split.chartCount,
-            split.overlapFaces,
-            split.overlapPairs,
-            split.candidates,
-            split.valid,
-            split.limited
+            fix.chartCount,
+            fix.overlapFaces,
+            fix.overlapPairs,
+            fix.candidates,
+            fix.valid,
+            fix.limited,
+            stats
         );
     }
 
@@ -630,7 +663,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("_atlas_info", &cumesh_xatlas::XAtlasWrapper::AtlasInfo)
         .def("_mesh_atlas_indices", &cumesh_xatlas::XAtlasWrapper::MeshAtlasIndices)
         .def_static("_validate_uv", &cumesh_xatlas::XAtlasWrapper::ValidateUv)
-        .def_static("_split_uv_overlaps", &cumesh_xatlas::XAtlasWrapper::SplitUvOverlaps)
+        .def_static("_fix_uv_overlaps", &cumesh_xatlas::XAtlasWrapper::FixUvOverlaps,
+                    py::arg("uv"), py::arg("faces"), py::arg("vertex_ids") = py::none(),
+                    py::arg("min_island_triangles") = 0)
         .def_static("_optimize_uv_distortion", &cumesh_xatlas::XAtlasWrapper::OptimizeUvDistortion);
 
     m.def("parameterize_lscm", &cumesh_xatlas::ParameterizeLscmBinding);

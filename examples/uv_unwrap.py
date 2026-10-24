@@ -10,7 +10,7 @@ from time import perf_counter
 
 
 # Select the identifier for the mesh to unwrap
-IDENTIFIER = "example-05"
+IDENTIFIER = "example-01"
 
 
 if __name__ == "__main__":
@@ -31,7 +31,13 @@ if __name__ == "__main__":
     mesh.init(vertices, faces)
 
     new_vertices, new_faces, uv, chart_texture = mesh.uv_unwrap(
+        compute_charts_kwargs={
+            "chart_merge_target": 32,
+            "chart_merge_strength": 0.8,
+        },
         flatten=["project"],
+        min_island_triangles=16,
+        fix_overlaps=True,
         debug_charts=True,
         verbose=True
     )

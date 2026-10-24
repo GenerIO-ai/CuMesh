@@ -72,6 +72,7 @@ public:
     Buffer<float> atlas_chart_adj_length;
     Buffer<float> atlas_chart_perims;
     Buffer<float> atlas_chart_areas;
+    Buffer<int> atlas_chart_face_counts;
     Buffer<int> atlas_chart2edge;
     Buffer<int> atlas_chart2edge_cnt;
     Buffer<int> atlas_chart2edge_offset;
@@ -486,6 +487,8 @@ public:
      *  @param  perimeter_area_ratio_weight   Coefficient for shape irregularity (long-strip) penalty. 
      *                                        Cost += (Perimeter / Area) * weight.
      *                                        Higher values penalize long strips and encourage circular/compact shapes.
+     *  @param  chart_merge_target           Triangle count at which the merge discount reaches zero (>= 2).
+     *  @param  chart_merge_strength         Cost discount at one triangle, in [0, 1].
      */
     void compute_charts(
         float threshold_cone_half_angle_rad, 
@@ -493,7 +496,9 @@ public:
         int global_iterations, 
         float smooth_strength,
         float area_penalty_weight,
-        float perimeter_area_ratio_weight
+        float perimeter_area_ratio_weight,
+        int chart_merge_target = 32,
+        float chart_merge_strength = 0.8f
     );
 
     /**

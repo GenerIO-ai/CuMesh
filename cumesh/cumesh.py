@@ -10,7 +10,21 @@ from .flatten_lscm import parameterize_charts as flatten_lscm_charts
 from .flatten_pca import project_chart_uvs as project_pca_uvs
 from .flatten_project import project_chart_uvs as project_chart_flatten_uvs
 from .flatten_tutte import parameterize_charts as flatten_tutte_charts
+from .repair_uv import repair_small_islands, optimize_repaired_island, count_uv_islands
 from . import _C
+
+
+def _validate_chart_merge_parameters(target, strength):
+    if isinstance(target, (bool, np.bool_)) or not isinstance(target, (int, np.integer)):
+        raise TypeError("chart_merge_target must be an integer")
+    if target < 2 or target > np.iinfo(np.int32).max:
+        raise ValueError("chart_merge_target must be between 2 and int32 max")
+    if isinstance(strength, (bool, np.bool_)) or not isinstance(strength, (int, float, np.integer, np.floating)):
+        raise TypeError("chart_merge_strength must be a number")
+    strength = float(strength)
+    if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
+        raise ValueError("chart_merge_strength must be finite and between 0 and 1")
+    return int(target), strength
 
 
 def _validate_uv_output(atlas, uvs, faces):
@@ -172,6 +186,45 @@ def _prepare_uv_chart(vertices, faces, uvs, vmaps, area_scale=None, allow_fallba
     return uv_np, faces_np, vmap_np, repaired, projected
 
 
+def _flatten_repair_chart(atlas, vertices, faces, method):
+    """Re-flatten a whole merged group with exactly the selected method."""
+    faces = np.ascontiguousarray(faces, dtype=np.int32)
+    vertices = np.ascontiguousarray(vertices, dtype=np.float32)
+    if method == "project":
+        uvs = project_chart_flatten_uvs(vertices, faces)
+        mapping = np.arange(len(vertices), dtype=np.int32)
+    elif method == "pca":
+        uvs = project_pca_uvs(vertices)
+        mapping = np.arange(len(vertices), dtype=np.int32)
+    elif method == "lscm":
+        batch = flatten_lscm_charts(
+            atlas, torch.from_numpy(vertices), torch.from_numpy(faces),
+            torch.tensor([0, len(vertices)], dtype=torch.int32),
+            torch.tensor([0, len(faces)], dtype=torch.int32),
+            flatten_tutte=False,
+        )
+        batch_uvs, batch_faces, batch_maps, _, _, success, _, _ = batch
+        if not bool(success[0]):
+            raise RuntimeError("The selected LSCM method could not flatten the merged group")
+        uvs, faces, mapping = batch_uvs.numpy(), batch_faces.numpy(), batch_maps.numpy()
+    else:
+        raise ValueError("UV island repair requires flatten='project', 'pca', or 'lscm'")
+
+    points = vertices.astype(np.float64)
+    mapped_faces = np.asarray(mapping)[faces]
+    p0, p1, p2 = (points[mapped_faces[:, corner]] for corner in range(3))
+    area_3d = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1).sum()
+    uv = np.asarray(uvs, dtype=np.float64)
+    u0, u1, u2 = (uv[faces[:, corner]] for corner in range(3))
+    area_uv = 0.5 * np.abs((u1[:, 0] - u0[:, 0]) * (u2[:, 1] - u0[:, 1]) -
+                           (u1[:, 1] - u0[:, 1]) * (u2[:, 0] - u0[:, 0])).sum()
+    scale = np.sqrt(area_3d / area_uv) if area_3d > 0 and area_uv > 1e-12 else None
+    uv, faces, mapping, _, _ = _prepare_uv_chart(
+        vertices, faces, uv, mapping, scale, allow_fallback=False,
+    )
+    return uv, faces, mapping
+
+
 def _emit_uv_warning(message, affected=0, total=0, critical=False):
     """Print a compact best-effort UV warning with its observed severity."""
     affected = int(max(0, affected))
@@ -276,13 +329,22 @@ def _fallback_pack_charts(records):
     )
 
 
-def _split_uv_chart_record(atlas, record, next_chart_index):
-    """Split one prepared chart into native overlap-free subcharts."""
-    result = atlas._split_uv_overlaps(
+def _fix_uv_chart_record(atlas, record, next_chart_index, min_island_triangles=0):
+    """Untangle local UV folds, then partition remaining conflicts once."""
+    if "repair_vertices" not in record:
+        if "positions" in record:
+            _, vertices = np.unique(record["positions"], axis=0, return_inverse=True)
+            record["repair_vertices"] = vertices.reshape(-1)
+        else:
+            record["repair_vertices"] = record["vmaps"]
+    result = atlas._fix_uv_overlaps(
         torch.from_numpy(record["uvs"]),
         torch.from_numpy(record["faces"]),
+        torch.from_numpy(np.ascontiguousarray(record["repair_vertices"], dtype=np.int64)),
+        min_island_triangles,
     )
     (
+        fixed_uvs,
         groups,
         group_count,
         overlap_faces,
@@ -290,23 +352,36 @@ def _split_uv_chart_record(atlas, record, next_chart_index):
         candidates,
         valid,
         limited,
+        patch_stats,
     ) = result
+    patch_stats = dict(patch_stats)
     groups = np.asarray(groups.numpy(), dtype=np.int64).reshape(-1)
     group_count = int(group_count)
-    if (
-        not bool(valid)
-        or len(groups) != len(record["faces"])
-        or group_count <= 1
-        or np.any(groups < 0)
-        or np.any(groups >= group_count)
-    ):
+    valid_labels = (
+        bool(valid)
+        and tuple(fixed_uvs.shape) == record["uvs"].shape
+        and len(groups) == len(record["faces"])
+        and group_count > 0
+        and not np.any(groups < 0)
+        and not np.any(groups >= group_count)
+    )
+    if not valid_labels:
+        for name in ("islands_before", "islands_after", "undersized_before", "undersized_after",
+                     "singletons_before", "singletons_after", "blocked_singletons"):
+            patch_stats[name] = None
+    else:
+        # The native routine works on a clone: rejected trials and exceptions
+        # cannot leave partially modified coordinates in the original record.
+        record = {**record, "uvs": np.ascontiguousarray(fixed_uvs.numpy(), dtype=np.float32)}
+    if not valid_labels or group_count <= 1:
         return [record], {
+            **patch_stats,
             "overlap_faces": int(overlap_faces),
             "overlap_pairs": int(overlap_pairs),
             "candidates": int(candidates),
             "split_charts": 0,
             "limited": bool(limited),
-            "failed": not bool(valid),
+            "failed": not valid_labels,
         }, next_chart_index
 
     subrecords = []
@@ -333,30 +408,33 @@ def _split_uv_chart_record(atlas, record, next_chart_index):
         if len(face_indices) == 0:
             continue
         selected_faces = record["faces"][face_indices]
-        used_vertices = np.unique(selected_faces.reshape(-1))
-        remap = np.full(len(record["uvs"]), -1, dtype=np.int64)
-        remap[used_vertices] = np.arange(len(used_vertices), dtype=np.int64)
+        # Compact only the selected corners. A full-chart remap per patch
+        # becomes quadratic when a difficult chart produces many patches.
+        used_vertices, remapped_faces = np.unique(selected_faces, return_inverse=True)
         subrecord = {
             "chart_index": (
                 int(record["chart_index"])
                 if group == 0
                 else int(next_chart_index)
             ),
-            "source_chart_index": int(record["chart_index"]),
+            "source_chart_index": int(record.get("source_chart_index", record["chart_index"])),
             "uvs": np.ascontiguousarray(record["uvs"][used_vertices], dtype=np.float32),
-            "faces": np.ascontiguousarray(remap[selected_faces], dtype=np.int32),
+            "faces": np.ascontiguousarray(remapped_faces.reshape(-1, 3), dtype=np.int32),
             "vmaps": np.ascontiguousarray(record["vmaps"][used_vertices], dtype=np.int32),
         }
         if "positions" in record:
             subrecord["positions"] = np.ascontiguousarray(
                 record["positions"][used_vertices], dtype=np.float32
             )
+        if "repair_vertices" in record:
+            subrecord["repair_vertices"] = record["repair_vertices"][used_vertices]
         if group != 0:
             next_chart_index += 1
         subrecords.append(subrecord)
     if not subrecords:
         subrecords = [record]
     return subrecords, {
+        **patch_stats,
         "overlap_faces": int(overlap_faces),
         "overlap_pairs": int(overlap_pairs),
         "candidates": int(candidates),
@@ -912,6 +990,8 @@ class CuMesh:
         smooth_strength: float=1,
         area_penalty_weight: float=0.0,
         perimeter_area_ratio_weight: float=0.0,
+        chart_merge_target: int=32,
+        chart_merge_strength: float=0.8,
     ):
         """
         Compute the atlas charts.
@@ -926,14 +1006,24 @@ class CuMesh:
             perimeter_area_ratio_weight: Coefficient for shape irregularity (long-strip) penalty. 
                                          Cost += (Perimeter / Area) * weight.
                                          Higher values penalize long strips and encourage circular/compact shapes.
+            chart_merge_target: Smaller chart triangle count at which the cost
+                discount fades to zero; must be at least 2. Defaults to 32.
+            chart_merge_strength: Fractional cost discount at one triangle,
+                fading linearly to zero at the target; must be in [0, 1].
+                Defaults to 0.8. Zero preserves the original merge costs.
         """
+        chart_merge_target, chart_merge_strength = _validate_chart_merge_parameters(
+            chart_merge_target, chart_merge_strength
+        )
         self.cu_mesh.compute_charts(
             threshold_cone_half_angle_rad,
             refine_iterations,
             global_iterations,
             smooth_strength,
             area_penalty_weight,
-            perimeter_area_ratio_weight
+            perimeter_area_ratio_weight,
+            chart_merge_target,
+            chart_merge_strength,
         )
         
     def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -964,6 +1054,8 @@ class CuMesh:
         return_stats: bool = False,
         debug_charts: bool = False,
         flatten: Sequence[str] = ("project",),
+        min_island_triangles: int = 16,
+        fix_overlaps: bool = True,
     ):
         """Generate packed UVs directly from CuMesh charts.
 
@@ -975,14 +1067,38 @@ class CuMesh:
         ``None`` unless ``debug_charts`` is true.
 
         Args:
+            compute_charts_kwargs: Options passed to GPU chart generation,
+                defaulting to chart_merge_target=32 and chart_merge_strength=0.8.
             flatten: Ordered flattening methods. Supported values are
                 ``"lscm"``, ``"project"``, ``"tutte"``, and ``"pca"``.
+            min_island_triangles: Target size for aggressively merging small
+                face groups before overlap splitting, then re-flattening whole
+                merged groups with the selected method. Requires one method:
+                "project", "pca", or "lscm". Unmergeable islands are retained;
+                subsequent overlap splitting may create small islands again.
+                Defaults to 16. Values 0 and 1 disable small-island merging.
+            fix_overlaps: Repair overlaps once, after small-island repair and
+                distortion optimization. Try bounded vertex untangling first,
+                then split unresolved conflicts into connected patches.
+                Defaults to True. False skips this step; final validation runs.
 
         The default is ``["project"]``. A chart uses the first method that
         produces valid UVs and falls through to later methods on failure. If
         every requested method fails, a final emergency planar UV is returned.
         """
+        if isinstance(min_island_triangles, bool) or not isinstance(min_island_triangles, int):
+            raise TypeError("min_island_triangles must be an integer")
+        if min_island_triangles < 0 or min_island_triangles > np.iinfo(np.int32).max:
+            raise ValueError("min_island_triangles must be between 0 and int32 max")
         flatten_methods = _normalize_flatten_methods(flatten)
+        if min_island_triangles > 1 and (
+            len(flatten_methods) != 1 or flatten_methods[0] not in ("project", "pca", "lscm")
+        ):
+            raise ValueError(
+                "min_island_triangles requires one selected flatten method: "
+                "'project', 'pca', or 'lscm'"
+            )
+
         if not flatten_methods:
             _emit_uv_warning(
                 "all flattening stages are disabled; emergency planar UVs will be used",
@@ -995,6 +1111,12 @@ class CuMesh:
         compute_kwargs.setdefault("refine_iterations", 0)
         compute_kwargs.setdefault("area_penalty_weight", 0.0)
         compute_kwargs.setdefault("perimeter_area_ratio_weight", 0.0)
+        # Validate outside the best-effort charting error handler: invalid
+        # settings must not silently return an emergency planar mesh.
+        compute_kwargs["chart_merge_target"], compute_kwargs["chart_merge_strength"] = _validate_chart_merge_parameters(
+            compute_kwargs.get("chart_merge_target", 32),
+            compute_kwargs.get("chart_merge_strength", 0.8),
+        )
 
         pack_opts = dict(xatlas_pack_charts_kwargs or {})
         pack_opts.setdefault("padding", 4)
@@ -1053,7 +1175,9 @@ class CuMesh:
                 f"chart generation failed ({type(error).__name__}); "
                 "returned a planar emergency UV mesh"
             )
-        log_completed("compute_charts", phase_started)
+        log_completed("compute_charts", phase_started,
+                      f"chart_merge_target={compute_kwargs['chart_merge_target']}, "
+                      f"chart_merge_strength={compute_kwargs['chart_merge_strength']}")
 
         phase_started = perf_counter()
         try:
@@ -1506,97 +1630,146 @@ class CuMesh:
                     # metric without another global gather.
                     "positions": chart_positions_np,
                 }
-                try:
-                    records_to_add, overlap_info, next_chart_index = _split_uv_chart_record(
-                        atlas, record, next_chart_index
-                    )
-                except Exception:
-                    records_to_add = [record]
-                    overlap_info = {
-                        "overlap_faces": 0,
-                        "overlap_pairs": 0,
-                        "candidates": 0,
-                        "split_charts": 0,
-                        "limited": False,
-                        "failed": True,
-                    }
-                overlap_faces += overlap_info["overlap_faces"]
-                overlap_pairs += overlap_info["overlap_pairs"]
-                overlap_candidates += overlap_info["candidates"]
-                overlap_split_charts += overlap_info["split_charts"]
-                overlap_detection_limited_charts += int(overlap_info["limited"])
-                overlap_charts += int(overlap_info["overlap_pairs"] > 0)
-                overlap_detection_failures += int(overlap_info["failed"])
-                chart_records.extend(records_to_add)
+                chart_records.append(record)
             except Exception:
                 atlas_add_failures += 1
                 dropped_charts += 1
                 dropped_faces += len(face_np)
 
-        # Optimize only after the first overlap split.  This keeps all
-        # flatteners on the same path and lets the cheap nonlinear pass see
-        # the actual final chart boundaries.  A changed chart is checked once
-        # more because moving its boundary can create a new self-overlap.
+        repair_stats = {
+            "min_island_triangles": min_island_triangles,
+            "repair_enabled": min_island_triangles > 1,
+            "repair_islands_before": None,
+            "repair_islands_after": None,
+            "repair_undersized_before": None,
+            "repair_undersized_after": None,
+            "repair_merges": 0,
+            "repair_reparameterized_groups": 0,
+            "repair_failed_groups": 0,
+            "repair_unmergeable_islands": 0,
+            "repair_non_manifold_edges": 0,
+            "repair_position_tolerance": 0.0,
+            "repair_failed": False,
+            "repair_seconds": 0.0,
+            "final_island_count": None,
+            "final_undersized_islands": None,
+        }
+        if min_island_triangles > 1 and chart_records:
+            repair_started = perf_counter()
+            try:
+                repaired_records, group_stats = repair_small_islands(
+                    atlas, chart_records, min_island_triangles,
+                    lambda vertices, faces: _flatten_repair_chart(
+                        atlas, vertices, faces, flatten_methods[0]
+                    ),
+                )
+                chart_records = repaired_records
+                repair_stats.update(group_stats)
+            except Exception as error:
+                repair_stats["repair_failed"] = True
+                repair_stats["repair_seconds"] = perf_counter() - repair_started
+                _emit_uv_warning(
+                    f"small-island grouping failed ({type(error).__name__}); "
+                    "retaining the original chart UVs", affected=1, total=1,
+                )
+            log_completed(
+                "merge and re-flatten small UV islands", repair_started,
+                f"islands={repair_stats['repair_islands_before']}->"
+                f"{repair_stats['repair_islands_after']}, "
+                f"undersized={repair_stats['repair_undersized_before']}->"
+                f"{repair_stats['repair_undersized_after']}, "
+                f"merges={repair_stats['repair_merges']}, "
+                f"reparameterized={repair_stats['repair_reparameterized_groups']}, "
+                f"unmergeable={repair_stats['repair_unmergeable_islands']}, "
+                f"failed_groups={repair_stats['repair_failed_groups']}",
+            )
+
+        # Finish optimization before the single overlap-fixing step, so an
+        # optimizer cannot undo a successful local repair or introduce a fold
+        # after the last overlap check.
         optimization_started = perf_counter()
         optimizer_available = callable(
             getattr(getattr(atlas, "atlas", None), "_optimize_uv_distortion", None)
         )
         if optimizer_available:
-            optimized_records = []
             for subrecord in chart_records:
                 if len(subrecord["faces"]) < 2:
-                    optimized_records.append(subrecord)
                     continue
                 distortion_optimization_attempts += 1
-                changed = False
                 try:
-                    changed = bool(atlas._optimize_uv_distortion(
-                        torch.from_numpy(subrecord["positions"]),
-                        torch.from_numpy(subrecord["uvs"]),
-                        torch.from_numpy(subrecord["faces"]),
-                    ))
+                    # Compact shared UV aliases for every chart, even when
+                    # small-island grouping is disabled.
+                    if optimize_repaired_island(atlas, subrecord):
+                        distortion_optimized_charts += 1
                 except Exception:
                     distortion_optimization_failures += 1
-
-                records_after_optimization = [subrecord]
-                if changed:
-                    distortion_optimized_charts += 1
-                    try:
-                        (
-                            records_after_optimization,
-                            overlap_info,
-                            next_chart_index,
-                        ) = _split_uv_chart_record(
-                            atlas, subrecord, next_chart_index
-                        )
-                    except Exception:
-                        overlap_info = {
-                            "overlap_faces": 0,
-                            "overlap_pairs": 0,
-                            "candidates": 0,
-                            "split_charts": 0,
-                            "limited": False,
-                            "failed": True,
-                        }
-                    overlap_faces += overlap_info["overlap_faces"]
-                    overlap_pairs += overlap_info["overlap_pairs"]
-                    overlap_candidates += overlap_info["candidates"]
-                    overlap_split_charts += overlap_info["split_charts"]
-                    overlap_detection_limited_charts += int(overlap_info["limited"])
-                    overlap_charts += int(overlap_info["overlap_pairs"] > 0)
-                    overlap_detection_failures += int(overlap_info["failed"])
-                optimized_records.extend(records_after_optimization)
-            chart_records = optimized_records
         else:
             distortion_optimization_unavailable = True
         distortion_optimization_seconds = perf_counter() - optimization_started
         log_completed(
-            "optimize chart distortion",
-            optimization_started,
+            "optimize chart distortion", optimization_started,
             f"attempts={distortion_optimization_attempts}, "
             f"optimized={distortion_optimized_charts}, "
             f"failures={distortion_optimization_failures}",
         )
+
+        next_chart_index = max((int(record["chart_index"]) for record in chart_records), default=-1) + 1
+        fixing_started = perf_counter()
+        fix_counts = ("islands_before", "islands_after", "undersized_before", "undersized_after",
+                      "singletons_before", "singletons_after", "blocked_singletons")
+        fix_counters = ("transferred_faces", "remaining_pairs", "repair_attempts", "repaired_triangles",
+                        "moved_variables", "fan_skips", "budget_skips", "repair_work",
+                        "detection_seconds", "repair_seconds", "partition_seconds")
+        fix_stats = {
+            "fix_enabled": fix_overlaps,
+            **{f"fix_{name}": 0 if fix_overlaps else None for name in fix_counts},
+            **{f"fix_{name}": 0 for name in fix_counters},
+        }
+        fixed_records = []
+        for record in chart_records:
+            if not fix_overlaps:
+                fixed_records.append(record)
+                continue
+            try:
+                records_to_add, overlap_info, next_chart_index = _fix_uv_chart_record(
+                    atlas, record, next_chart_index, min_island_triangles
+                )
+            except Exception:
+                records_to_add = [record]
+                overlap_info = {
+                    "overlap_faces": 0,
+                    "overlap_pairs": 0,
+                    "candidates": 0,
+                    "split_charts": 0,
+                    "limited": False,
+                    "failed": True,
+                }
+            overlap_faces += overlap_info["overlap_faces"]
+            overlap_pairs += overlap_info["overlap_pairs"]
+            overlap_candidates += overlap_info["candidates"]
+            overlap_split_charts += overlap_info["split_charts"]
+            overlap_detection_limited_charts += int(overlap_info["limited"])
+            overlap_charts += int(overlap_info["overlap_pairs"] > 0)
+            overlap_detection_failures += int(overlap_info["failed"])
+            for name in fix_counts:
+                current, value = fix_stats[f"fix_{name}"], overlap_info.get(name)
+                fix_stats[f"fix_{name}"] = current + value if current is not None and value is not None else None
+            for name in fix_counters:
+                fix_stats[f"fix_{name}"] += overlap_info.get(name, 0)
+            fixed_records.extend(records_to_add)
+        chart_records = fixed_records
+        fix_stats["fix_seconds"] = perf_counter() - fixing_started if fix_overlaps else 0.0
+        if fix_overlaps:
+            log_completed("fix overlapping UV islands", fixing_started,
+                          f"pairs={overlap_pairs}->{fix_stats['fix_remaining_pairs']}, "
+                          f"repaired={fix_stats['fix_repaired_triangles']}, "
+                          f"islands={fix_stats['fix_islands_before']}->{fix_stats['fix_islands_after']}, "
+                          f"undersized={fix_stats['fix_undersized_before']}->{fix_stats['fix_undersized_after']}, "
+                          f"singletons={fix_stats['fix_singletons_before']}->{fix_stats['fix_singletons_after']}, "
+                          f"fan_skips={fix_stats['fix_fan_skips']}, budget_skips={fix_stats['fix_budget_skips']}, "
+                          f"transferred={fix_stats['fix_transferred_faces']}, splits={overlap_split_charts}")
+        elif verbose:
+            print("CuMesh UV Unwrap: fix overlapping UV islands: disabled (fix_overlaps=False)", flush=True)
 
         records_added = []
         atlas_index = 0
@@ -1617,6 +1790,7 @@ class CuMesh:
         chart_records = records_added
         for record in chart_records:
             record.pop("positions", None)
+            record.pop("repair_vertices", None)
 
         log_completed(
             "parameterize charts, optimize, and add UV meshes",
@@ -1770,7 +1944,7 @@ class CuMesh:
         )
         mapped_vertex_ids = np.unique(vmaps_np) if len(vmaps_np) else np.empty((0,), dtype=np.int32)
         unmapped_vertices = int(np.setdiff1d(source_vertex_ids, mapped_vertex_ids).size)
-        expected_face_count = len(packed_faces) // 3
+        expected_face_count = len(packed_faces)
         missing_faces = max(0, expected_face_count - int(faces.shape[0]))
         atlas_complete = (
             missing_faces == 0
@@ -1820,7 +1994,7 @@ class CuMesh:
                 num_charts,
                 critical=True,
             ))
-        if overlap_charts:
+        if overlap_split_charts:
             warning_levels.append(_emit_uv_warning(
                 "self-overlapping UV chart regions were split before packing",
                 overlap_faces,
@@ -1905,11 +2079,33 @@ class CuMesh:
                 f"final vertex mapping failed ({type(error).__name__}); "
                 "returned a planar emergency UV mesh",
             )
+        if min_island_triangles > 1 and (verbose or return_stats):
+            try:
+                final_islands, final_small = count_uv_islands(
+                    vertices.numpy(), uvs.numpy(), faces.numpy(), min_island_triangles,
+                    position_tolerance=repair_stats["repair_position_tolerance"],
+                )
+                repair_stats["final_island_count"] = int(final_islands)
+                repair_stats["final_undersized_islands"] = int(final_small)
+                if verbose:
+                    print(
+                        f"CuMesh UV Unwrap: final islands={final_islands}, "
+                        f"below {min_island_triangles} triangles={final_small}",
+                        flush=True,
+                    )
+            except Exception as error:
+                _emit_uv_warning(
+                    f"final island counting failed ({type(error).__name__}); UVs are retained",
+                    affected=1, total=1,
+                )
+
         overview_started = perf_counter()
         native_fallback_attempts = int(native_stats.get("fallback_charts", 0))
         native_failed_charts = int(native_stats.get("failed_charts", 0))
         stats = {
             "chart_count": num_charts,
+            "chart_merge_target": compute_kwargs["chart_merge_target"],
+            "chart_merge_strength": compute_kwargs["chart_merge_strength"],
             "packed_chart_count": len(chart_records),
             "debug_charts": bool(debug_charts),
             "flatten": list(flatten_methods),
@@ -1954,6 +2150,8 @@ class CuMesh:
             "packing_seconds": packing_seconds,
             "xatlas_atlas_count": atlas_info["atlas_count"],
             "uv_validation_passed": bool(validation["valid"]),
+            **fix_stats,
+            **repair_stats,
             **native_stats,
         }
 

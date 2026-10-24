@@ -1,6 +1,8 @@
 #include "cumesh.h"
 #include "dtypes.cuh"
 #include "shared.h"
+#include "chart_merge.h"
+#include <cmath>
 #include <cub/cub.cuh>
 
 
@@ -157,8 +159,11 @@ static __global__ void compute_chart_adjacency_cost_kernel(
     const float* chart_adj_length,
     const float* chart_perims,
     const float* chart_areas,
+    const int* chart_face_counts,
     float area_penalty_weight,
     float perimeter_area_ratio_weight,
+    int chart_merge_target,
+    float chart_merge_strength,
     const int E,
     float* chart_adj_costs
 ) {
@@ -190,7 +195,11 @@ static __global__ void compute_chart_adjacency_cost_kernel(
     float new_perim = chart_perims[c0] + chart_perims[c1] - 2 * chart_adj_length[tid];
     cost += perimeter_area_ratio_weight * (new_perim * new_perim / new_area);
 
-    chart_adj_costs[tid] = cost;
+    // One symmetric edge cost drives both mutual-neighbor selection and the
+    // acceptance threshold. Re-evaluate the fade from current counts each round.
+    chart_adj_costs[tid] = cost * chart_merge_cost_multiplier(
+        chart_face_counts[c0], chart_face_counts[c1], chart_merge_target, chart_merge_strength
+    );
 }
 
 
@@ -514,21 +523,21 @@ void compute_chart_normal_cones(
     CUDA_CHECK(cudaFree(faces_ids));
     
     // 2. Get CSR format for chart-face assignment
-    int* cu_chart_size;
     int* cu_num_charts;
     int* cu_unique_chart_ids;
-    CUDA_CHECK(cudaMalloc(&cu_chart_size, (C + 1) * sizeof(int)));
+    mesh.atlas_chart_face_counts.resize(C + 1);
+    mesh.atlas_chart_face_counts.zero();
     CUDA_CHECK(cudaMalloc(&cu_num_charts, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&cu_unique_chart_ids, (C + 1) * sizeof(int)));
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
-        sorted_chart_ids, cu_unique_chart_ids, cu_chart_size, cu_num_charts,
+        sorted_chart_ids, cu_unique_chart_ids, mesh.atlas_chart_face_counts.ptr, cu_num_charts,
         F
     ));
     mesh.cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         mesh.cub_temp_storage.ptr, temp_storage_bytes,
-        sorted_chart_ids, cu_unique_chart_ids, cu_chart_size, cu_num_charts,
+        sorted_chart_ids, cu_unique_chart_ids, mesh.atlas_chart_face_counts.ptr, cu_num_charts,
         F
     ));
     CUDA_CHECK(cudaFree(cu_num_charts));
@@ -539,16 +548,15 @@ void compute_chart_normal_cones(
     temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, temp_storage_bytes,
-        cu_chart_size, cu_chart_offsets,
+        mesh.atlas_chart_face_counts.ptr, cu_chart_offsets,
         C + 1
     ));
     mesh.cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         mesh.cub_temp_storage.ptr, temp_storage_bytes,
-        cu_chart_size, cu_chart_offsets,
+        mesh.atlas_chart_face_counts.ptr, cu_chart_offsets,
         C + 1
     ));
-    CUDA_CHECK(cudaFree(cu_chart_size));
 
     // 3. Compute chart normals and areas
     float* cu_sorted_face_areas;
@@ -1046,8 +1054,13 @@ void CuMesh::compute_charts(
     int global_iterations, 
     float smooth_strength,
     float area_penalty_weight,
-    float perimeter_area_ratio_weight
+    float perimeter_area_ratio_weight,
+    int chart_merge_target,
+    float chart_merge_strength
 ) {
+    TORCH_CHECK(chart_merge_target >= 2, "chart_merge_target must be at least 2");
+    TORCH_CHECK(std::isfinite(chart_merge_strength) && chart_merge_strength >= 0.0f && chart_merge_strength <= 1.0f,
+                "chart_merge_strength must be finite and between 0 and 1");
     if (this->manifold_face_adj.is_empty()) {
         this->get_manifold_face_adjacency();
     }
@@ -1092,8 +1105,11 @@ void CuMesh::compute_charts(
                 this->atlas_chart_adj_length.ptr,
                 this->atlas_chart_perims.ptr,
                 this->atlas_chart_areas.ptr,
+                this->atlas_chart_face_counts.ptr,
                 area_penalty_weight,
                 perimeter_area_ratio_weight,
+                chart_merge_target,
+                chart_merge_strength,
                 E,
                 this->edge_collapse_costs.ptr
             );

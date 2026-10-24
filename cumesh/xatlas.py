@@ -125,8 +125,8 @@ class Atlas:
     def _validate_uv(self, uvs, faces):
         return self.atlas._validate_uv(uvs, faces)
 
-    def _split_uv_overlaps(self, uvs, faces):
-        return self.atlas._split_uv_overlaps(uvs, faces)
+    def _fix_uv_overlaps(self, uvs, faces, vertex_ids=None, min_island_triangles=0):
+        return self.atlas._fix_uv_overlaps(uvs, faces, vertex_ids, min_island_triangles)
 
     def _optimize_uv_distortion(self, positions, uvs, faces):
         return self.atlas._optimize_uv_distortion(positions, uvs, faces)

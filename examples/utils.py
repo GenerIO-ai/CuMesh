@@ -33,7 +33,14 @@ def load_mesh(filename: str | os.PathLike[str]) -> trimesh.Trimesh:
     asset directory. GLB scenes are loaded as a single :class:`Trimesh`.
     """
     path = _asset_path(INPUT_DIR, filename)
-    return trimesh.load_mesh(path, force="mesh")
+    mesh = trimesh.load_mesh(path, force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        # Dump each instance with its scene transform applied before combining.
+        meshes = [geometry for geometry in mesh.dump() if isinstance(geometry, trimesh.Trimesh)]
+        if not meshes:
+            raise ValueError(f"Scene contains no triangle mesh geometry: {path}")
+        mesh = trimesh.util.concatenate(meshes)
+    return mesh
 
 
 def save_mesh(mesh: trimesh.Trimesh, filename: str | os.PathLike[str]) -> Path:

@@ -51,6 +51,7 @@ CuMesh::~CuMesh() {
     atlas_chart_adj_length.free();
     atlas_chart_perims.free();
     atlas_chart_areas.free();
+    atlas_chart_face_counts.free();
     atlas_chart2edge.free();
     atlas_chart2edge_cnt.free();
     atlas_chart2edge_offset.free();
@@ -131,6 +132,7 @@ void CuMesh::clear_cache() {
     atlas_chart_adj_length.free();
     atlas_chart_perims.free();
     atlas_chart_areas.free();
+    atlas_chart_face_counts.free();
     atlas_chart2edge.free();
     atlas_chart2edge_cnt.free();
     atlas_chart2edge_offset.free();
